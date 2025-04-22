@@ -26,6 +26,8 @@ export interface ScanOptions {
   onProgress?: (progress: ScanProgress) => void;
   /** 最大文件大小（字节），超过此大小的文件将被忽略，默认 500MB */
   maxFileSize?: number;
+  /** 要跳过的目录名列表（相对于扫描目录的路径） */
+  skipDirs?: string[];
 }
 
 export interface ScanProgress {
@@ -39,4 +41,6 @@ export interface ScanProgress {
   matchedFiles: number;
   /** 被忽略的大文件数 */
   ignoredLargeFiles: number;
+  /** 被跳过的目录数 */
+  skippedDirs: number;
 } 

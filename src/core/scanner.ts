@@ -17,18 +17,48 @@ export async function scanFiles(options: ScanOptions): Promise<FileItem[]> {
     pattern, 
     depth = -1, 
     onProgress,
-    maxFileSize = 500 * 1024 * 1024 // 默认 500MB
+    maxFileSize = 500 * 1024 * 1024, // 默认 500MB
+    skipDirs = [] // 默认空白名单
   } = options;
+
   const regex = new RegExp(pattern);
   const results: FileItem[] = [];
+  
+  // 将白名单路径标准化
+  const normalizedSkipDirs = skipDirs.map(dir => 
+    path.normalize(dir).toLowerCase()
+  );
   
   const progress: ScanProgress = {
     currentDir: '',
     scannedFiles: 0,
     scannedDirs: 0,
     matchedFiles: 0,
-    ignoredLargeFiles: 0
+    ignoredLargeFiles: 0,
+    skippedDirs: 0 // 新增：记录跳过的目录数
   };
+
+  /**
+   * 检查目录是否在跳过列表中
+   * @param dirPath 目录路径
+   * @returns 是否应该跳过
+   */
+  function shouldSkipDirectory(dirPath: string): boolean {
+    // 获取相对于根目录的路径
+    const relativePath = path.relative(rootDir, dirPath);
+    if (!relativePath) return false;
+
+    const normalizedPath = path.normalize(relativePath).toLowerCase();
+    
+    // 检查是否匹配白名单中的任何路径
+    return normalizedSkipDirs.some(skipDir => {
+      // 完全匹配
+      if (normalizedPath === skipDir) return true;
+      // 当前目录是跳过目录的子目录
+      if (normalizedPath.startsWith(skipDir + path.sep)) return true;
+      return false;
+    });
+  }
 
   async function scanDirectory(
     currentDir: string,
@@ -41,6 +71,16 @@ export async function scanFiles(options: ScanOptions): Promise<FileItem[]> {
 
     try {
       progress.currentDir = currentDir;
+      
+      // 检查是否应该跳过当前目录
+      if (shouldSkipDirectory(currentDir)) {
+        progress.skippedDirs++;
+        if (onProgress) {
+          onProgress({ ...progress });
+        }
+        return;
+      }
+
       progress.scannedDirs++;
       if (onProgress) {
         onProgress({ ...progress });
