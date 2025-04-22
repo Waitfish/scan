@@ -85,6 +85,7 @@ async function main(): Promise<void> {
     await createTestDirectory();
 
     const rules: MatchRule[] = [
+      [['mjs'], 'clean.*'], 
       [['docx', 'doc'], '^MeiTuan.*'], 
       [['pdf', 'xls'], '^BuYunSou.*'],
       [['jpg'], '.*']
