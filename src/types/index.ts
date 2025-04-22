@@ -15,15 +15,18 @@ export interface FileItem {
   size: number;
 }
 
+/** 文件匹配规则：[后缀列表, 文件名正则] */
+export type MatchRule = [string[], string];
+
 export interface ScanOptions {
   /** 扫描的根目录 */
   rootDir: string;
-  /** 文件名匹配正则表达式 */
-  pattern: string;
+  /** 文件匹配规则列表 */
+  matchRules: MatchRule[];
   /** 扫描深度，-1表示扫描到没有下级目录为止 */
   depth: number;
   /** 进度回调函数 */
-  onProgress?: (progress: ScanProgress) => void;
+  onProgress?: (progress: ScanProgress, matchedFile?: FileItem) => void;
   /** 最大文件大小（字节），超过此大小的文件将被忽略，默认 500MB */
   maxFileSize?: number;
   /** 要跳过的目录名列表（相对于扫描目录的路径） */
@@ -37,7 +40,7 @@ export interface ScanProgress {
   scannedFiles: number;
   /** 已扫描的目录总数 */
   scannedDirs: number;
-  /** 找到的匹配文件数 */
+  /** 找到的匹配文件总数 */
   matchedFiles: number;
   /** 被忽略的大文件数 */
   ignoredLargeFiles: number;
