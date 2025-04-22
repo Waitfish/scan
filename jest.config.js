@@ -12,5 +12,9 @@ module.exports = {
       lines: 80,
       statements: 80
     }
+  },
+  moduleFileExtensions: ['ts', 'tsx', 'js', 'jsx', 'json', 'node'],
+  transform: {
+    '^.+\\.tsx?$': 'ts-jest'
   }
 }; 

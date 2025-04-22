@@ -3,6 +3,9 @@ node_modules/
 package-lock.json
 yarn.lock
 
+
+src/**/*.js
+
 # Build
 dist/
 build/
