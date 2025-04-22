@@ -11,6 +11,8 @@ export interface FileItem {
   createTime: Date;
   /** 文件修改时间 */
   modifyTime: Date;
+  /** 文件大小（字节） */
+  size: number;
 }
 
 export interface ScanOptions {
@@ -22,6 +24,8 @@ export interface ScanOptions {
   depth: number;
   /** 进度回调函数 */
   onProgress?: (progress: ScanProgress) => void;
+  /** 最大文件大小（字节），超过此大小的文件将被忽略，默认 500MB */
+  maxFileSize?: number;
 }
 
 export interface ScanProgress {
@@ -33,4 +37,6 @@ export interface ScanProgress {
   scannedDirs: number;
   /** 找到的匹配文件数 */
   matchedFiles: number;
+  /** 被忽略的大文件数 */
+  ignoredLargeFiles: number;
 } 

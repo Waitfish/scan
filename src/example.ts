@@ -11,13 +11,15 @@ async function main(): Promise<void> {
       rootDir: '/Users/daiwangjian/',    // 扫描目录
       pattern: '\\.ts$',         // 匹配所有 .ts 文件
       depth: 20,                 // 扫描深度为20层
+      maxFileSize: 500 * 1024 * 1024, // 500MB
       onProgress: (progress) => {
         console.log(`\r扫描进度: ${progress.currentDir}`);
         console.log(`已扫描目录: ${progress.scannedDirs}`);
         console.log(`已扫描文件: ${progress.scannedFiles}`);
         console.log(`匹配文件: ${progress.matchedFiles}`);
+        console.log(`忽略的大文件: ${progress.ignoredLargeFiles}`);
         // 清空当前行，准备下一次输出
-        process.stdout.write('\x1B[3A\x1B[0J');
+        process.stdout.write('\x1B[4A\x1B[0J');
       }
     });
 
@@ -27,6 +29,7 @@ async function main(): Promise<void> {
     files.forEach(file => {
       console.log(`文件名: ${file.name}`);
       console.log(`路径: ${file.path}`);
+      console.log(`大小: ${(file.size / 1024 / 1024).toFixed(2)} MB`);
       console.log(`创建时间: ${file.createTime}`);
       console.log(`修改时间: ${file.modifyTime}`);
       console.log('-----------------');

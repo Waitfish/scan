@@ -12,7 +12,13 @@ import { FileItem, ScanOptions, ScanProgress } from '../types';
  * @returns 文件列表
  */
 export async function scanFiles(options: ScanOptions): Promise<FileItem[]> {
-  const { rootDir, pattern, depth = -1, onProgress } = options;
+  const { 
+    rootDir, 
+    pattern, 
+    depth = -1, 
+    onProgress,
+    maxFileSize = 500 * 1024 * 1024 // 默认 500MB
+  } = options;
   const regex = new RegExp(pattern);
   const results: FileItem[] = [];
   
@@ -20,7 +26,8 @@ export async function scanFiles(options: ScanOptions): Promise<FileItem[]> {
     currentDir: '',
     scannedFiles: 0,
     scannedDirs: 0,
-    matchedFiles: 0
+    matchedFiles: 0,
+    ignoredLargeFiles: 0
   };
 
   async function scanDirectory(
@@ -51,13 +58,18 @@ export async function scanFiles(options: ScanOptions): Promise<FileItem[]> {
           progress.scannedFiles++;
           if (regex.test(entry.name)) {
             const stats = await fs.stat(fullPath);
-            results.push({
-              path: fullPath,
-              name: entry.name,
-              createTime: stats.birthtime,
-              modifyTime: stats.mtime
-            });
-            progress.matchedFiles++;
+            if (stats.size <= maxFileSize) {
+              results.push({
+                path: fullPath,
+                name: entry.name,
+                createTime: stats.birthtime,
+                modifyTime: stats.mtime,
+                size: stats.size
+              });
+              progress.matchedFiles++;
+            } else {
+              progress.ignoredLargeFiles++;
+            }
           }
           if (onProgress) {
             onProgress({ ...progress });
