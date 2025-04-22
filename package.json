@@ -8,7 +8,6 @@
     "dist",
     "README.md"
   ],
-  
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
@@ -29,6 +28,7 @@
     "url": "https://github.com/waitfish/scan.git"
   },
   "dependencies": {
+    "compressing": "^1.10.1",
     "fs-extra": "^11.3.0"
   },
   "devDependencies": {

@@ -3,16 +3,22 @@
  */
 
 export interface FileItem {
-  /** 文件绝对路径 */
+  /** 文件绝对路径 (对于压缩包内文件，指压缩包的路径) */
   path: string;
-  /** 文件名 */
+  /** 文件名 (对于压缩包内文件，指内部文件的名称) */
   name: string;
-  /** 文件创建时间 */
+  /** 文件创建时间 (对于压缩包内文件，使用压缩包的创建时间) */
   createTime: Date;
-  /** 文件修改时间 */
+  /** 文件修改时间 (对于压缩包内文件，使用压缩包的修改时间) */
   modifyTime: Date;
-  /** 文件大小（字节） */
+  /** 文件大小（字节）(对于压缩包内文件，指未压缩的大小) */
   size: number;
+  /** 文件来源: 'filesystem' 或 'archive' */
+  origin?: 'filesystem' | 'archive';
+  /** 如果来源是 'archive'，则为压缩包的绝对路径 */
+  archivePath?: string;
+  /** 如果来源是 'archive'，则为文件在压缩包内的相对路径 */
+  internalPath?: string;
 }
 
 /** 文件匹配规则：[后缀列表, 文件名正则] */
@@ -36,10 +42,12 @@ export interface ScanOptions {
 export interface ScanProgress {
   /** 当前扫描的目录 */
   currentDir: string;
-  /** 已扫描的文件总数 */
+  /** 已扫描的文件总数 (包括压缩包内扫描的) */
   scannedFiles: number;
   /** 已扫描的目录总数 */
   scannedDirs: number;
+  /** 已扫描的压缩包总数 */
+  archivesScanned: number;
   /** 找到的匹配文件总数 */
   matchedFiles: number;
   /** 被忽略的大文件数 */

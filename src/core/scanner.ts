@@ -4,7 +4,8 @@
 
 import * as path from 'path';
 import * as fs from 'fs-extra';
-import { FileItem, ScanOptions, ScanProgress } from '../types';
+import * as compressing from 'compressing';
+import { FileItem, ScanOptions, ScanProgress,  } from '../types';
 
 /** 预处理后的匹配规则 */
 interface ProcessedRule {
@@ -12,88 +13,183 @@ interface ProcessedRule {
   nameRegex: RegExp;
 }
 
+// 定义支持扫描的压缩包后缀
+const ARCHIVE_EXTENSIONS = new Set(['.zip', '.tar', '.tgz', '.tar.gz']);
+
 /**
  * 扫描文件
  * @param options 扫描选项
  * @returns 文件列表
  */
 export async function scanFiles(options: ScanOptions): Promise<FileItem[]> {
-  const { 
-    rootDir, 
-    matchRules, 
-    depth = -1, 
+  const {
+    rootDir,
+    matchRules,
+    depth = -1,
     onProgress,
-    maxFileSize = 500 * 1024 * 1024, // 默认 500MB
-    skipDirs = [] // 默认空白名单
+    maxFileSize = 500 * 1024 * 1024,
+    skipDirs = [],
   } = options;
 
   const results: FileItem[] = [];
-  
-  // 预处理匹配规则
+
   const processedRules: ProcessedRule[] = matchRules.map(([extensions, namePattern]) => {
-    const normalizedExtensions = extensions.map(ext => 
+    const normalizedExtensions = extensions.map((ext) =>
       ext.startsWith('.') ? ext.toLowerCase() : '.' + ext.toLowerCase()
     );
     return {
       extensions: new Set(normalizedExtensions),
-      nameRegex: new RegExp(namePattern)
+      nameRegex: new RegExp(namePattern),
     };
   });
 
-  // 将白名单路径标准化
-  const normalizedSkipDirs = skipDirs.map(dir => 
+  const normalizedSkipDirs = skipDirs.map((dir) =>
     path.normalize(dir).toLowerCase()
   );
-  
+
   const progress: ScanProgress = {
     currentDir: '',
     scannedFiles: 0,
     scannedDirs: 0,
+    archivesScanned: 0,
     matchedFiles: 0,
     ignoredLargeFiles: 0,
-    skippedDirs: 0
+    skippedDirs: 0,
   };
 
-  /**
-   * 检查目录是否在跳过列表中
-   * @param dirPath 目录路径
-   * @returns 是否应该跳过
-   */
   function shouldSkipDirectory(dirPath: string): boolean {
     const relativePath = path.relative(rootDir, dirPath);
     if (!relativePath) return false;
     const normalizedPath = path.normalize(relativePath).toLowerCase();
-    return normalizedSkipDirs.some(skipDir => {
+    return normalizedSkipDirs.some((skipDir) => {
       if (normalizedPath === skipDir) return true;
       if (normalizedPath.startsWith(skipDir + path.sep)) return true;
       return false;
     });
   }
 
+  /**
+   * 扫描压缩包内部
+   */
+  async function scanArchive(
+    archivePath: string,
+    archiveCreateTime: Date,
+    archiveModifyTime: Date
+  ): Promise<void> {
+    progress.archivesScanned++;
+
+    let StreamType: any;
+    const ext = path.extname(archivePath).toLowerCase();
+    const isTgz = ext === '.tgz' || archivePath.toLowerCase().endsWith('.tar.gz');
+
+    if (ext === '.zip') {
+      StreamType = compressing.zip.UncompressStream;
+    } else if (ext === '.tar' || isTgz) {
+      StreamType = isTgz ? compressing.tgz.UncompressStream : compressing.tar.UncompressStream;
+    } else {
+      console.warn(`不支持的压缩包类型，跳过扫描: ${archivePath}`);
+      return;
+    }
+
+    if (!StreamType) {
+      console.warn(`无法找到 ${ext} 的解压流类型，跳过扫描: ${archivePath}`);
+      return;
+    }
+    
+    try {
+      const stream = new StreamType({ source: archivePath });
+      
+      await new Promise<void>((resolve, reject) => {
+        stream.on('error', (err: Error) => {
+          console.warn(`读取压缩包时出错 ${archivePath}:`, err.message);
+          reject(err);
+        });
+
+        stream.on('finish', () => {
+          resolve();
+        });
+
+        stream.on('entry', (
+          header: { name: string; type: 'file' | 'directory', size?: number }, 
+          entryStream: NodeJS.ReadableStream, 
+          next: () => void
+        ) => {
+          const processEntry = () => {
+            try {
+              if (header.type === 'file') {
+                const internalPath = header.name;
+                const internalName = path.basename(internalPath);
+                const internalExt = path.extname(internalName).toLowerCase();
+                let isMatch = false;
+
+                for (const rule of processedRules) {
+                  if (rule.extensions.has(internalExt) && rule.nameRegex.test(internalName)) {
+                    isMatch = true;
+                    break;
+                  }
+                }
+
+                if (isMatch) {
+                  const internalSize = header.size ?? 0;
+                  if (internalSize <= maxFileSize) {
+                    const fileItem: FileItem = {
+                      path: archivePath,
+                      name: internalName,
+                      createTime: archiveCreateTime,
+                      modifyTime: archiveModifyTime,
+                      size: internalSize,
+                      origin: 'archive',
+                      archivePath: archivePath,
+                      internalPath: internalPath,
+                    };
+                    results.push(fileItem);
+                    progress.matchedFiles++;
+                    if (onProgress) {
+                      onProgress({ ...progress }, fileItem);
+                    }
+                  } else {
+                    progress.ignoredLargeFiles++;
+                  }
+                }
+              }
+              entryStream.resume(); 
+              next();
+            } catch (entryError) {
+              console.warn(`处理压缩包条目时出错 ${archivePath} > ${header.name}:`, entryError);
+              entryStream.resume();
+              next();
+            }
+          };
+          processEntry();
+        });
+      });
+    } catch (archiveError) {
+      console.warn(`无法处理压缩包 ${archivePath}:`, archiveError);
+    }
+  }
+
   async function scanDirectory(
     currentDir: string,
     currentDepth: number
   ): Promise<void> {
-    // 如果设置了深度限制且当前深度超过限制，则停止扫描
     if (depth !== -1 && currentDepth > depth) {
       return;
     }
 
     try {
       progress.currentDir = currentDir;
-      
-      // 检查是否应该跳过当前目录
+
       if (shouldSkipDirectory(currentDir)) {
         progress.skippedDirs++;
         if (onProgress) {
-          onProgress({ ...progress }); // 报告跳过
+          onProgress({ ...progress });
         }
         return;
       }
 
       progress.scannedDirs++;
       if (onProgress) {
-        onProgress({ ...progress }); // 报告进入目录
+        onProgress({ ...progress });
       }
 
       const entries = await fs.readdir(currentDir, { withFileTypes: true });
@@ -104,53 +200,56 @@ export async function scanFiles(options: ScanOptions): Promise<FileItem[]> {
         if (entry.isDirectory()) {
           await scanDirectory(fullPath, currentDepth + 1);
         } else if (entry.isFile()) {
-          progress.scannedFiles++;
           const fileExt = path.extname(entry.name).toLowerCase();
-          let isMatch = false;
           
-          // 检查是否匹配任何规则
-          for (const rule of processedRules) {
-            if (rule.extensions.has(fileExt) && rule.nameRegex.test(entry.name)) {
-              isMatch = true;
-              break; // 找到一个匹配规则即可
-            }
-          }
-
-          if (isMatch) {
+          if (ARCHIVE_EXTENSIONS.has(fileExt)) {
             try {
               const stats = await fs.stat(fullPath);
-              if (stats.size <= maxFileSize) {
-                const fileItem: FileItem = {
-                  path: fullPath,
-                  name: entry.name,
-                  createTime: stats.birthtime,
-                  modifyTime: stats.mtime,
-                  size: stats.size
-                };
-                results.push(fileItem);
-                progress.matchedFiles++;
-                if (onProgress) {
-                  // 关键：在匹配且符合大小要求时，传递 FileItem
-                  onProgress({ ...progress }, fileItem);
-                }
-              } else {
-                progress.ignoredLargeFiles++;
-                // 如果需要，也可以在这里调用 onProgress 报告忽略了大文件
-                // if (onProgress) { onProgress({ ...progress }); }
-              }
+              await scanArchive(fullPath, stats.birthtime, stats.mtime);
             } catch (statError) {
-              console.warn(`无法获取文件状态: ${fullPath}`, statError);
+              console.warn(`无法获取压缩包状态: ${fullPath}`, statError);
             }
+            continue;
+          } else {
+             // ----- 常规文件处理逻辑 -----
+             progress.scannedFiles++;
+             let isMatch = false;
+             for (const rule of processedRules) {
+              if (rule.extensions.has(fileExt) && rule.nameRegex.test(entry.name)) {
+                isMatch = true;
+                break;
+              }
+            }
+            if (isMatch) {
+              try {
+                const stats = await fs.stat(fullPath);
+                if (stats.size <= maxFileSize) {
+                  const fileItem: FileItem = {
+                    path: fullPath,
+                    name: entry.name,
+                    createTime: stats.birthtime,
+                    modifyTime: stats.mtime,
+                    size: stats.size,
+                    origin: 'filesystem', // 明确来源
+                  };
+                  results.push(fileItem);
+                  progress.matchedFiles++;
+                  if (onProgress) {
+                    onProgress({ ...progress }, fileItem);
+                  }
+                } else {
+                  progress.ignoredLargeFiles++;
+                }
+              } catch (statError) {
+                console.warn(`无法获取文件状态: ${fullPath}`, statError);
+              }
+            }
+            // ----- 结束常规文件处理逻辑 -----
           }
-          // 如果需要在每次扫描文件后都更新进度（即使未匹配），可以在这里调用 onProgress
-          // else if (onProgress) { onProgress({ ...progress }); }
         }
       }
     } catch (error) {
-      // 忽略无法访问的目录
       console.warn(`无法访问目录: ${currentDir}`, error);
-      // 如果需要，可以在这里调用 onProgress 报告错误
-      // if (onProgress) { onProgress({ ...progress }); }
     }
   }
 
