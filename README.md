@@ -98,7 +98,13 @@ findReports();
 #### `ScanOptions`
 
 | 选项          | 类型                                                   | 描述                                                              | 默认值             |
-|---------------|------------------------------------------------------|-----------------------------------------------------------------|-----------------|\n| `rootDir`     | `string`                                             | **必需**，要扫描的根目录绝对路径。                                     |                 |\n| `matchRules`  | `MatchRule[]` (即 `[string[], string][]`)              | **必需**，文件匹配规则列表。每个规则是一个元组 `[后缀列表, 文件名正则]`。 |                 |\n| `depth`       | `number`                                             | 扫描深度。`0` 表示只扫描根目录，`-1` 表示扫描所有子目录。               | `-1`            |\n| `maxFileSize` | `number`                                             | 文件大小上限（字节）。超过此大小的文件将被忽略（对压缩包内文件同样有效）。       | `524288000` (500MB) |\n| `skipDirs`    | `string[]`                                           | 要跳过的目录名列表（相对于 `rootDir` 的路径，如 `[\'node_modules\']`）。扫描器不会进入这些目录，也不会扫描这些目录下的压缩包。 | `[]`            |\n| `onProgress`  | `(progress: ScanProgress, matchedFile?: FileItem) => void` | 可选的回调函数，用于报告扫描进度和实时匹配到的文件。                      |                 |
+|---------------|------------------------------------------------------|-----------------------------------------------------------------|-----------------|
+| `rootDir`     | `string`                                             | **必需**，要扫描的根目录绝对路径。                                     |                 |
+| `matchRules`  | `MatchRule[]` (即 `[string[], string][]`)              | **必需**，文件匹配规则列表。每个规则是一个元组 `[后缀列表, 文件名正则]`。 |                 |
+| `depth`       | `number`                                             | 扫描深度。`0` 表示只扫描根目录，`-1` 表示扫描所有子目录。               | `-1`            |
+| `maxFileSize` | `number`                                             | 文件大小上限（字节）。超过此大小的文件将被忽略（对压缩包内文件同样有效）。       | `524288000` (500MB) |
+| `skipDirs`    | `string[]`                                           | 要跳过的目录名列表（相对于 `rootDir` 的路径，如 `['node_modules']`）。扫描器不会进入这些目录，也不会扫描这些目录下的压缩包。 | `[]`            |
+| `onProgress`  | `(progress: ScanProgress, matchedFile?: FileItem) => void` | 可选的回调函数，用于报告扫描进度和实时匹配到的文件。                      |                 |
 
 #### `FileItem`
 
@@ -116,7 +122,15 @@ findReports();
 
 #### `ScanProgress`
 
-| 属性                | 类型     | 描述               |\n|---------------------|----------|------------------|\n| `currentDir`        | `string` | 当前正在扫描的目录     |\n| `scannedFiles`      | `number` | 已扫描的文件系统文件总数 |\n| `scannedDirs`       | `number` | 已扫描的目录总数     |\n| `archivesScanned`   | `number` | 已尝试扫描的压缩包总数 |\n| `matchedFiles`      | `number` | 找到的匹配文件总数   |\n| `ignoredLargeFiles` | `number` | 因过大而被忽略的文件数 |\n| `skippedDirs`       | `number` | 因规则而被跳过的目录数 |\n
+| 属性                | 类型     | 描述               |
+|---------------------|----------|------------------|
+| `currentDir`        | `string` | 当前正在扫描的目录     |
+| `scannedFiles`      | `number` | 已扫描的文件系统文件总数 |
+| `scannedDirs`       | `number` | 已扫描的目录总数     |
+| `archivesScanned`   | `number` | 已尝试扫描的压缩包总数 |
+| `matchedFiles`      | `number` | 找到的匹配文件总数   |
+| `ignoredLargeFiles` | `number` | 因过大而被忽略的文件数 |
+| `skippedDirs`       | `number` | 因规则而被跳过的目录数 |
 
 ## 测试与示例中的 RAR 文件
 

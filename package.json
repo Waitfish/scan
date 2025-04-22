@@ -1,6 +1,6 @@
 {
   "name": "@smallfish2025/scan",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "文件扫描器",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
