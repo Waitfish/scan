@@ -1,0 +1,73 @@
+{
+  "rules": {
+    "formatting": {
+      "indent_size": 2,
+      "indent_style": "space",
+      "max_line_length": 100,
+      "end_of_line": "lf",
+      "insert_final_newline": true,
+      "trim_trailing_whitespace": true
+    },
+    "naming": {
+      "files": {
+        "pattern": "^[a-z0-9-]+(\\.[a-z0-9-]+)*\\.(ts|tsx)$",
+        "message": "文件名应该使用小写字母、数字和连字符，以 .ts 或 .tsx 结尾"
+      },
+      "classes": {
+        "pattern": "^[A-Z][a-zA-Z0-9]*$",
+        "message": "类名应该使用 PascalCase"
+      },
+      "functions": {
+        "pattern": "^[a-z][a-zA-Z0-9]*$",
+        "message": "函数名应该使用 camelCase"
+      },
+      "variables": {
+        "pattern": "^[a-z][a-zA-Z0-9]*$",
+        "message": "变量名应该使用 camelCase"
+      },
+      "constants": {
+        "pattern": "^[A-Z][A-Z0-9_]*$",
+        "message": "常量名应该使用 UPPER_SNAKE_CASE"
+      }
+    },
+    "imports": {
+      "order": [
+        "node_modules",
+        "absolute",
+        "relative"
+      ],
+      "group_separator": true,
+      "newline_after_imports": true
+    },
+    "types": {
+      "no_any": true,
+      "no_implicit_any": true,
+      "strict_null_checks": true,
+      "no_unused_locals": true,
+      "no_unused_parameters": true
+    },
+    "error_handling": {
+      "require_try_catch": true,
+      "require_error_logging": true,
+      "custom_error_classes": true
+    },
+    "comments": {
+      "require_jsdoc": true,
+      "require_file_header": true,
+      "require_class_documentation": true,
+      "require_function_documentation": true
+    },
+    "testing": {
+      "test_file_pattern": "*.test.ts",
+      "require_test_coverage": 80
+    }
+  },
+  "ignore": [
+    "node_modules",
+    "dist",
+    "build",
+    "coverage",
+    "*.d.ts",
+    "*.min.js"
+  ]
+} 
