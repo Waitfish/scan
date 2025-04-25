@@ -30,6 +30,64 @@ export interface FileItem {
 /** 文件匹配规则：[后缀列表, 文件名正则] */
 export type MatchRule = [string[], string];
 
+/**
+ * 文件稳定性检测选项
+ */
+export interface StabilityCheckOptions {
+  /** 是否启用文件稳定性检测 */
+  enabled: boolean;
+  /** 最大重试次数 */
+  maxRetries: number;
+  /** 重试间隔（毫秒） */
+  retryInterval: number;
+  /** 检测间隔（毫秒） */
+  checkInterval: number;
+  /** 大文件阈值（字节） */
+  largeFileThreshold: number;
+  /** 是否对大文件跳过读取检测 */
+  skipReadForLargeFiles: boolean;
+}
+
+/**
+ * 队列系统选项
+ */
+export interface QueueOptions {
+  /** 是否启用队列系统 */
+  enabled: boolean;
+  /** 最大并发检测数量 */
+  maxConcurrentChecks: number;
+  /** 最大并发传输数量 */
+  maxConcurrentTransfers: number;
+  /** 稳定性检测重试延迟（毫秒） */
+  stabilityRetryDelay: number;
+}
+
+/**
+ * 传输选项
+ */
+export interface TransportOptions {
+  /** 是否启用传输功能 */
+  enabled: boolean;
+  /** 传输协议 */
+  protocol: 'ftp' | 'sftp';
+  /** 服务器主机 */
+  host: string;
+  /** 服务器端口 */
+  port: number;
+  /** 用户名 */
+  username: string;
+  /** 密码 */
+  password: string;
+  /** 远程路径 */
+  remotePath: string;
+  /** 每个包最多包含的文件数 */
+  packageSize: number;
+  /** 重试次数 */
+  retryCount: number;
+  /** 超时时间（毫秒） */
+  timeout: number;
+}
+
 export interface ScanOptions {
   /** 扫描的根目录 */
   rootDir: string;
@@ -47,6 +105,18 @@ export interface ScanOptions {
   scanNestedArchives?: boolean;
   /** 最大嵌套层级，默认为5 */
   maxNestedLevel?: number;
+  /** 文件稳定性检测选项 */
+  stabilityCheck?: StabilityCheckOptions;
+  /** 队列系统选项 */
+  queue?: QueueOptions;
+  /** 传输选项 */
+  transport?: TransportOptions;
+  /** 是否计算MD5值 */
+  calculateMd5?: boolean;
+  /** 是否创建压缩包 */
+  createPackage?: boolean;
+  /** 压缩包命名模式（支持日期变量如{date}） */
+  packageNamePattern?: string;
 }
 
 export interface ScanProgress {
@@ -68,6 +138,21 @@ export interface ScanProgress {
   nestedArchivesScanned?: number;
   /** 当前正在处理的嵌套层级 */
   currentNestedLevel?: number;
+  /** 已处理的文件MD5计算数 */
+  processedMd5Count?: number;
+  /** 已打包的文件数 */
+  packagedFilesCount?: number;
+  /** 已传输的文件数 */
+  transportedFilesCount?: number;
+  /** 队列状态 */
+  queueStats?: {
+    waiting: number;
+    processing: number;
+    completed: number;
+    failed: number;
+    retrying: number;
+    total: number;
+  };
 }
 
 /**
@@ -75,7 +160,7 @@ export interface ScanProgress {
  */
 export interface FailureItem {
   /** 失败类型 */
-  type: 'directoryAccess' | 'fileStat' | 'archiveOpen' | 'archiveEntry' | 'rarOpen' | 'nestedArchive';
+  type: 'directoryAccess' | 'fileStat' | 'archiveOpen' | 'archiveEntry' | 'rarOpen' | 'nestedArchive' | 'stability' | 'md5' | 'packaging' | 'transport';
   /** 发生失败的文件、目录或压缩包的路径 */
   path: string;
   /** 如果是压缩包内条目处理失败，这里是内部路径 */
@@ -94,4 +179,15 @@ export interface ScanResult {
   results: FileItem[];
   /** 扫描过程中发生的失败列表 */
   failures: FailureItem[];
+  /** 处理的文件数据（添加MD5后） */
+  processedFiles?: FileItem[];
+  /** 创建的包文件列表 */
+  packages?: string[];
+  /** 传输结果 */
+  transportResults?: {
+    success: boolean;
+    filePath: string;
+    remotePath: string;
+    error?: string;
+  }[];
 } 

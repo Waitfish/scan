@@ -1,0 +1,238 @@
+/**
+ * @file MD5计算模块
+ * 用于计算文件的MD5值
+ */
+
+import * as crypto from 'crypto';
+import * as fs from 'fs';
+import * as os from 'os';
+import { FileItem } from '../types';
+
+/**
+ * MD5计算进度回调函数类型
+ */
+export type Md5ProgressCallback = (progress: number, filePath: string) => void;
+
+/**
+ * MD5计算选项
+ */
+export interface Md5Options {
+  /** 是否使用优化的流式处理（用于大文件） */
+  useStreamProcessing?: boolean;
+  /** 缓冲区大小（字节） */
+  bufferSize?: number;
+  /** 大文件阈值（字节），超过此大小将使用流式处理 */
+  largeFileThreshold?: number;
+  /** 进度回调函数 */
+  onProgress?: Md5ProgressCallback;
+}
+
+/**
+ * 默认MD5计算选项
+ */
+const DEFAULT_MD5_OPTIONS: Md5Options = {
+  useStreamProcessing: true,
+  bufferSize: 8 * 1024 * 1024, // 8MB
+  largeFileThreshold: 100 * 1024 * 1024, // 100MB
+};
+
+/**
+ * 计算文件的MD5值
+ * @param filePath 文件路径
+ * @param options MD5计算选项
+ * @returns MD5哈希值的Promise
+ */
+export async function calculateMd5(
+  filePath: string, 
+  options: Md5Options = {}
+): Promise<string> {
+  const opts = { ...DEFAULT_MD5_OPTIONS, ...options };
+  
+  try {
+    // 获取文件大小
+    const stats = await fs.promises.stat(filePath);
+    const fileSize = stats.size;
+    
+    // 对于大文件，使用流式处理以减少内存使用
+    if (fileSize > opts.largeFileThreshold! && opts.useStreamProcessing) {
+      return calculateMd5Stream(filePath, fileSize, opts);
+    }
+    
+    // 对于小文件，使用标准方法
+    return calculateMd5Standard(filePath);
+  } catch (error: any) {
+    throw new Error(`计算MD5失败 (${filePath}): ${error.message}`);
+  }
+}
+
+/**
+ * 使用标准方法计算小文件的MD5值
+ * @param filePath 文件路径
+ * @returns MD5哈希值的Promise
+ */
+async function calculateMd5Standard(filePath: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    try {
+      const hash = crypto.createHash('md5');
+      const stream = fs.createReadStream(filePath);
+      
+      stream.on('data', data => hash.update(data));
+      stream.on('end', () => resolve(hash.digest('hex')));
+      stream.on('error', error => reject(error));
+    } catch (error) {
+      reject(error);
+    }
+  });
+}
+
+/**
+ * 使用流式处理计算大文件的MD5值，支持进度报告
+ * @param filePath 文件路径
+ * @param fileSize 文件大小
+ * @param options MD5计算选项
+ * @returns MD5哈希值的Promise
+ */
+async function calculateMd5Stream(
+  filePath: string, 
+  fileSize: number, 
+  options: Md5Options
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    try {
+      const hash = crypto.createHash('md5');
+      const stream = fs.createReadStream(filePath, {
+        highWaterMark: options.bufferSize
+      });
+      
+      let processedBytes = 0;
+      let lastProgressReported = 0;
+      
+      stream.on('data', (data) => {
+        hash.update(data);
+        
+        // 更新处理的字节数
+        processedBytes += data.length;
+        
+        // 计算进度百分比
+        const progress = Math.floor((processedBytes / fileSize) * 100);
+        
+        // 避免报告太频繁，只在进度明显变化时报告
+        if (options.onProgress && progress > lastProgressReported) {
+          options.onProgress(progress, filePath);
+          lastProgressReported = progress;
+        }
+      });
+      
+      stream.on('end', () => {
+        // 确保报告100%进度
+        if (options.onProgress && lastProgressReported < 100) {
+          options.onProgress(100, filePath);
+        }
+        
+        resolve(hash.digest('hex'));
+      });
+      
+      stream.on('error', (error) => reject(error));
+    } catch (error) {
+      reject(error);
+    }
+  });
+}
+
+/**
+ * 为文件项计算MD5值
+ * @param fileItem 文件项
+ * @param options MD5计算选项
+ * @returns 更新后的文件项
+ */
+export async function calculateFileMd5(
+  fileItem: FileItem, 
+  options: Md5Options = {}
+): Promise<FileItem> {
+  try {
+    const md5 = await calculateMd5(fileItem.path, options);
+    return {
+      ...fileItem,
+      md5
+    };
+  } catch (error) {
+    // 如果MD5计算失败，保留原始文件项
+    console.error(`计算文件 ${fileItem.path} 的MD5值失败:`, error);
+    return fileItem;
+  }
+}
+
+/**
+ * 并行计算多个文件的MD5值
+ * @param files 文件项数组
+ * @param options MD5计算选项
+ * @param concurrency 并行计算的文件数
+ * @returns 更新后的文件项数组
+ */
+export async function calculateBatchMd5(
+  files: FileItem[], 
+  options: Md5Options = {}, 
+  concurrency = 0
+): Promise<FileItem[]> {
+  // 如果未指定并发数，则根据CPU核心数自动计算
+  if (!concurrency) {
+    concurrency = Math.max(1, Math.min(
+      os.cpus().length,
+      Math.floor(os.freemem() / (100 * 1024 * 1024)), // 每100MB内存一个并发
+      files.length
+    ));
+  }
+  
+  // 创建结果数组
+  const result = [...files];
+  
+  // 将文件分成批次处理
+  for (let i = 0; i < files.length; i += concurrency) {
+    const batch = files.slice(i, i + concurrency);
+    
+    // 并行处理当前批次
+    const promises = batch.map(async (file, index) => {
+      const updatedFile = await calculateFileMd5(file, options);
+      result[i + index] = updatedFile;
+    });
+    
+    // 等待当前批次完成
+    await Promise.all(promises);
+  }
+  
+  return result;
+}
+
+/**
+ * 优化的大文件MD5计算
+ * 根据文件大小选择最优的计算方法
+ * @param filePath 文件路径
+ * @param options MD5计算选项
+ * @returns MD5哈希值
+ */
+export async function calculateOptimizedMd5(
+  filePath: string, 
+  options: Md5Options = {}
+): Promise<string> {
+  try {
+    // 获取文件大小
+    const stats = await fs.promises.stat(filePath);
+    const fileSize = stats.size;
+    
+    // 根据文件大小选择不同的处理策略
+    if (fileSize < 10 * 1024 * 1024) { // 小于10MB
+      // 小文件：直接计算
+      return calculateMd5Standard(filePath);
+    } else if (fileSize < 1024 * 1024 * 1024) { // 小于1GB
+      // 中等文件：流式处理
+      const opts = { ...DEFAULT_MD5_OPTIONS, ...options, bufferSize: 8 * 1024 * 1024 };
+      return calculateMd5Stream(filePath, fileSize, opts);
+    } else {
+      // 大文件：优化的流式处理，更大的缓冲区
+      const opts = { ...DEFAULT_MD5_OPTIONS, ...options, bufferSize: 32 * 1024 * 1024 };
+      return calculateMd5Stream(filePath, fileSize, opts);
+    }
+  } catch (error: any) {
+    throw new Error(`计算优化MD5失败 (${filePath}): ${error.message}`);
+  }
+} 

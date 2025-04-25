@@ -3,4 +3,9 @@
  */
 
 export * from './core/scanner';
+export * from './core/stability';
+export * from './core/md5';
+export * from './core/packaging';
+export * from './core/transport';
+export * from './core/queue';
 export * from './types';
