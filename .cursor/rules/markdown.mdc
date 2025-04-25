@@ -13,8 +13,8 @@ alwaysApply: false
 - 标题内容不能重复，可通过添加修饰词区分（如版本号）
 - 列表项缩进必须一致（无序列表使用 `-`，有序列表使用 `1.`）
 - 代码块使用三个反引号 (```) 并指定语言
-- 链接使用 `[文本](URL)` 格式
-- 图片使用 `![替代文本](图片URL)` 格式
+- 链接使用 `[文本](mdc:URL)` 格式
+- 图片使用 `![替代文本](mdc:图片URL)` 格式
 
 ## 空白与格式
 
@@ -46,12 +46,18 @@ alwaysApply: false
 
 ### 三级标题
 
+代码和上一行要有一个空行
+
 ```javascript
 // 代码示例
 const example = "代码块使用三个反引号";
 ```
 
-[链接示例](https://example.com)
+[链接示例](mdc:https:/example.com)
 ```
 
-这些规则将确保你的 Markdown 文档通过 markdownlint 检查，并保持一致的格式和可读性。
+- 编写mermaid图表的时候，加上以下代码，适应屏幕宽度
+```mermaid
+%%{init: {'theme': 'default', 'themeVariables': { 'fontSize': '14px'}, 'flowchart': {'useMaxWidth': true, 'htmlLabels': true, 'curve': 'linear'} } }%%
+```
+

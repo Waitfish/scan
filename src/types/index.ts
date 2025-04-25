@@ -23,6 +23,8 @@ export interface FileItem {
   nestedLevel?: number;
   /** 完整的嵌套路径表示，例如：outer.zip/inner.zip/file.txt */
   nestedPath?: string;
+  /** 文件的md5值 */
+  md5?: string;
 }
 
 /** 文件匹配规则：[后缀列表, 文件名正则] */
