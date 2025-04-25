@@ -54,4 +54,28 @@ export interface ScanProgress {
   ignoredLargeFiles: number;
   /** 被跳过的目录数 */
   skippedDirs: number;
+}
+
+/**
+ * 表示扫描过程中发生的失败信息
+ */
+export interface FailureItem {
+  /** 失败类型 */
+  type: 'directoryAccess' | 'fileStat' | 'archiveOpen' | 'archiveEntry' | 'rarOpen';
+  /** 发生失败的文件、目录或压缩包的路径 */
+  path: string;
+  /** 如果是压缩包内条目处理失败，这里是内部路径 */
+  entryPath?: string;
+  /** 具体的错误信息 */
+  error: string;
+}
+
+/**
+ * scanFiles 函数的返回结果
+ */
+export interface ScanResult {
+  /** 成功匹配的文件列表 */
+  results: FileItem[];
+  /** 扫描过程中发生的失败列表 */
+  failures: FailureItem[];
 } 

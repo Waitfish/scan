@@ -6,7 +6,7 @@ import * as path from 'path';
 import * as fs from 'fs-extra';
 import * as compressing from 'compressing';
 import { createExtractorFromFile } from 'node-unrar-js'; // 导入 RAR 相关
-import { FileItem, ScanOptions, ScanProgress } from '../types';
+import { FileItem, ScanOptions, ScanProgress, FailureItem, ScanResult } from '../types'; // 导入新类型
 
 /** 预处理后的匹配规则 */
 interface ProcessedRule {
@@ -20,9 +20,9 @@ const ARCHIVE_EXTENSIONS = new Set(['.zip', '.tar', '.tgz', '.tar.gz', '.rar']);
 /**
  * 扫描文件
  * @param options 扫描选项
- * @returns 文件列表
+ * @returns 包含成功结果和失败列表的对象
  */
-export async function scanFiles(options: ScanOptions): Promise<FileItem[]> {
+export async function scanFiles(options: ScanOptions): Promise<ScanResult> { // 更新返回类型
   const {
     rootDir,
     matchRules,
@@ -33,6 +33,7 @@ export async function scanFiles(options: ScanOptions): Promise<FileItem[]> {
   } = options;
 
   const results: FileItem[] = [];
+  const failures: FailureItem[] = []; // 初始化失败列表
 
   const processedRules: ProcessedRule[] = matchRules.map(([extensions, namePattern]) => {
     const normalizedExtensions = extensions.map((ext) =>
@@ -88,12 +89,16 @@ export async function scanFiles(options: ScanOptions): Promise<FileItem[]> {
     } else if (ext === '.tar' || isTgz) {
       StreamType = isTgz ? compressing.tgz.UncompressStream : compressing.tar.UncompressStream;
     } else {
-      console.warn(`[compressing] 不支持的压缩包类型: ${archivePath}`);
+      const message = `[compressing] 不支持的压缩包类型: ${archivePath}`;
+      console.warn(message);
+      failures.push({ type: 'archiveOpen', path: archivePath, error: message }); // 记录失败
       return;
     }
 
     if (!StreamType) {
-      console.warn(`[compressing] 无法找到解压流类型: ${ext}`);
+      const message = `[compressing] 无法找到解压流类型: ${ext}`;
+      console.warn(message);
+      failures.push({ type: 'archiveOpen', path: archivePath, error: message }); // 记录失败
       return;
     }
     
@@ -102,8 +107,10 @@ export async function scanFiles(options: ScanOptions): Promise<FileItem[]> {
       
       await new Promise<void>((resolve, reject) => {
         stream.on('error', (err: Error) => {
-          console.warn(`[compressing] 读取压缩包时出错 ${archivePath}:`, err.message);
-          reject(err); 
+          const message = `[compressing] 读取压缩包时出错 ${archivePath}: ${err.message}`;
+          console.warn(message);
+          failures.push({ type: 'archiveOpen', path: archivePath, error: err.message }); // 记录失败
+          reject(err); // 继续拒绝 Promise 以便外层 catch 可以捕获（虽然这里不需要外层也捕获）
         });
         stream.on('finish', resolve);
         stream.on('entry', (
@@ -149,8 +156,16 @@ export async function scanFiles(options: ScanOptions): Promise<FileItem[]> {
               }
               entryStream.resume(); 
               next();
-            } catch (entryError) {
-              console.warn(`[compressing] 处理条目时出错 ${archivePath} > ${header.name}:`, entryError);
+            } catch (entryError: any) {
+              const message = `[compressing] 处理条目时出错 ${archivePath} > ${header.name}: ${entryError?.message || entryError}`;
+              console.warn(message);
+              // 记录条目处理失败
+              failures.push({
+                type: 'archiveEntry',
+                path: archivePath,
+                entryPath: header.name,
+                error: entryError?.message || String(entryError),
+              });
               entryStream.resume(); 
               next();
             }
@@ -158,8 +173,19 @@ export async function scanFiles(options: ScanOptions): Promise<FileItem[]> {
           processEntry();
         });
       });
-    } catch (archiveError) {
-      console.warn(`[compressing] 无法处理压缩包 ${archivePath}:`, archiveError);
+    } catch (archiveError: any) {
+      // 这个 catch 主要处理 stream.on('error') reject 的情况，以及 new StreamType 可能的同步错误
+      // 错误已经在 stream.on('error') 中记录到 failures
+      // 如果是 new StreamType 的错误，需要在这里记录
+      if (!failures.some(f => f.path === archivePath && f.type === 'archiveOpen')) {
+        const message = `[compressing] 无法处理压缩包 ${archivePath}: ${archiveError?.message || archiveError}`;
+        console.warn(message);
+        failures.push({
+          type: 'archiveOpen',
+          path: archivePath,
+          error: archiveError?.message || String(archiveError),
+        });
+      }
     }
   }
 
@@ -180,43 +206,55 @@ export async function scanFiles(options: ScanOptions): Promise<FileItem[]> {
       const list = extractor.getFileList();
       // 遍历文件头 - 必须完整遍历以释放资源!
       for (const fileHeader of list.fileHeaders) {
-        if (fileHeader.flags.directory) {
-          continue; // 跳过目录
-        }
-
-        const internalPath = fileHeader.name;
-        const internalName = path.basename(internalPath);
-        const internalExt = path.extname(internalName).toLowerCase();
-        let isMatch = false;
-
-        for (const rule of processedRules) {
-          if (rule.extensions.has(internalExt) && rule.nameRegex.test(internalName)) {
-            isMatch = true;
-            break;
-          }
-        }
-
-        if (isMatch) {
-          const internalSize = fileHeader.unpSize;
-          if (internalSize <= maxFileSize) {
-            const fileItem: FileItem = {
-              path: archivePath,
-              name: internalName,
-              createTime: archiveCreateTime,
-              modifyTime: archiveModifyTime,
-              size: internalSize,
-              origin: 'archive',
-              archivePath: archivePath,
-              internalPath: internalPath,
-            };
-            results.push(fileItem);
-            progress.matchedFiles++;
-            if (onProgress) {
-              onProgress({ ...progress }, fileItem);
+         try { // 添加内层 try...catch 以捕获单个条目处理错误
+            if (fileHeader.flags.directory) {
+              continue; // 跳过目录
             }
-          } else {
-            progress.ignoredLargeFiles++;
-          }
+
+            const internalPath = fileHeader.name;
+            const internalName = path.basename(internalPath);
+            const internalExt = path.extname(internalName).toLowerCase();
+            let isMatch = false;
+
+            for (const rule of processedRules) {
+              if (rule.extensions.has(internalExt) && rule.nameRegex.test(internalName)) {
+                isMatch = true;
+                break;
+              }
+            }
+
+            if (isMatch) {
+              const internalSize = fileHeader.unpSize;
+              if (internalSize <= maxFileSize) {
+                const fileItem: FileItem = {
+                  path: archivePath,
+                  name: internalName,
+                  createTime: archiveCreateTime,
+                  modifyTime: archiveModifyTime,
+                  size: internalSize,
+                  origin: 'archive',
+                  archivePath: archivePath,
+                  internalPath: internalPath,
+                };
+                results.push(fileItem);
+                progress.matchedFiles++;
+                if (onProgress) {
+                  onProgress({ ...progress }, fileItem);
+                }
+              } else {
+                progress.ignoredLargeFiles++;
+              } 
+            }
+        } catch (entryError: any) { 
+           const message = `[unrar] 处理条目时出错 ${archivePath} > ${fileHeader?.name}: ${entryError?.message || entryError}`;
+           console.warn(message);
+           failures.push({ 
+              type: 'archiveEntry', 
+              path: archivePath, 
+              entryPath: fileHeader?.name, 
+              error: entryError?.message || String(entryError)
+            });
+           // 继续处理下一个条目
         }
       }
       // 注意：getFileList() 返回的 fileHeaders 是生成器，
@@ -224,8 +262,9 @@ export async function scanFiles(options: ScanOptions): Promise<FileItem[]> {
       // 如果使用 list.fileHeaders.next() 手动迭代，则需要确保迭代到最后。
       
     } catch (error: any) {
-      // node-unrar-js 可能会抛出特定错误
-      console.warn(`[unrar] 处理 RAR 压缩包时出错 ${archivePath}:`, error.message || error);
+      const message = `[unrar] 处理 RAR 压缩包时出错 ${archivePath}: ${error.message || error}`;
+      console.warn(message);
+      failures.push({ type: 'rarOpen', path: archivePath, error: error.message || String(error) }); // 记录失败
     } 
     // 不需要手动关闭 extractor，迭代器完成时资源会自动处理
   }
@@ -270,8 +309,10 @@ export async function scanFiles(options: ScanOptions): Promise<FileItem[]> {
                 } else {
                     await scanCompressingArchive(fullPath, stats.birthtime, stats.mtime);
                 }
-            } catch (statError) {
-              console.warn(`无法获取压缩包状态: ${fullPath}`, statError);
+            } catch (statError: any) {
+              const message = `无法获取压缩包状态: ${fullPath}: ${statError?.message || statError}`;
+              console.warn(message);
+              failures.push({ type: 'fileStat', path: fullPath, error: statError?.message || String(statError) }); // 记录失败
             }
             continue; // 跳过后续的常规文件处理
           } else {
@@ -304,18 +345,22 @@ export async function scanFiles(options: ScanOptions): Promise<FileItem[]> {
                 } else {
                   progress.ignoredLargeFiles++;
                 }
-              } catch (statError) {
-                console.warn(`无法获取文件状态: ${fullPath}`, statError);
+              } catch (statError: any) {
+                const message = `无法获取文件状态: ${fullPath}: ${statError?.message || statError}`;
+                console.warn(message);
+                failures.push({ type: 'fileStat', path: fullPath, error: statError?.message || String(statError) }); // 记录失败
               }
             }
           }
         }
       }
-    } catch (error) {
-      console.warn(`无法访问目录: ${currentDir}`, error);
+    } catch (error: any) {
+      const message = `无法访问目录: ${currentDir}: ${error?.message || error}`;
+      console.warn(message);
+      failures.push({ type: 'directoryAccess', path: currentDir, error: error?.message || String(error) }); // 记录失败
     }
   }
 
   await scanDirectory(rootDir, 0);
-  return results;
+  return { results, failures }; // 返回包含结果和失败的对象
 } 

@@ -6,7 +6,7 @@ import * as path from 'path';
 import * as fs from 'fs-extra';
 import * as compressing from 'compressing'; // Import compressing
 import { scanFiles } from './core/scanner';
-import { MatchRule  } from './types';
+import { MatchRule} from './types';
 
 // --- 测试目录设置 ---
 const testRootDir = path.join(__dirname, '../example-test-run');
@@ -95,7 +95,7 @@ async function main(): Promise<void> {
 
     console.log('\n开始扫描 (包含压缩包内部)...');
 
-    const files = await scanFiles({
+    const { results: matchedFiles, failures } = await scanFiles({
       rootDir: testRootDir,
       matchRules: rules,
       depth: -1,
@@ -147,10 +147,10 @@ async function main(): Promise<void> {
     // 最终结果
     console.log('\n\n扫描完成!');
     console.log('-----------------');
-    console.log(`总共找到 ${files.length} 个匹配文件 (大小 <= ${(maxSize / 1024).toFixed(0)} KB):`);
+    console.log(`总共找到 ${matchedFiles.length} 个匹配文件 (大小 <= ${(maxSize / 1024).toFixed(0)} KB):`);
     console.log('-----------------');
     
-    files.forEach((file, index) => {
+    matchedFiles.forEach((file, index) => {
       console.log(`[${index + 1}] ${file.name}`);
       console.log(`    来源 (origin): ${file.origin ?? 'filesystem'}`);
       if (file.origin === 'archive') {
@@ -164,6 +164,24 @@ async function main(): Promise<void> {
       console.log(`    修改时间: ${file.modifyTime.toLocaleString()}`);
       console.log('-----------------');
     });
+
+    // 检查并打印失败信息
+    if (failures.length > 0) {
+        console.warn('\n扫描过程中遇到以下错误:');
+        console.warn('-----------------');
+        failures.forEach((fail, index) => {
+            console.warn(`[失败 ${index + 1}] 类型: ${fail.type}`);
+            console.warn(`  路径: ${fail.path}`);
+            if (fail.entryPath) {
+                console.warn(`  内部条目: ${fail.entryPath}`);
+            }
+            console.warn(`  错误: ${fail.error}`);
+            console.warn('-----------------');
+        });
+    } else {
+        console.log('\n扫描过程中未报告任何错误。');
+    }
+
     console.log(`测试目录位于: ${testRootDir}`);
 
   } catch (error) {
