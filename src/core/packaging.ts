@@ -92,7 +92,7 @@ const DEFAULT_OPTIONS: PackageOptions = {
   compressionLevel: 6,
   metadataFileName: 'metadata.json',
   tempDir: path.join(process.cwd(), 'temp'),
-  enhancedMetadata: false,
+  enhancedMetadata: true,
   metadataVersion: '1.0'
 };
 

@@ -49,6 +49,49 @@ export async function scanFiles(options: ScanOptions): Promise<ScanResult> { // 
   // 记录处理过的压缩文件以避免重复处理
   const processedArchives = new Set<string>();
 
+  // 导入额外的模块和创建额外的结果存储
+  let processedFiles: FileItem[] = [];
+  let packagePaths: string[] = [];
+  let transportResults: any[] = [];
+  
+  // 导入所需模块，确保它们已加载
+  let fileQueue: any = null;
+  let transporter: any = null;
+  
+  // 如果开启了队列处理
+  if (options.queue?.enabled) {
+    try {
+      // 导入文件处理队列模块
+      const { FileProcessingQueue } = require('./queue');
+      fileQueue = new FileProcessingQueue(options.queue, { 
+        maxRetries: options.stabilityCheck?.maxRetries || 3 
+      });
+    } catch (error: any) {
+      console.warn('加载队列模块失败:', error?.message);
+      failures.push({
+        type: 'directoryAccess',
+        path: 'queue.ts',
+        error: `加载队列模块失败: ${error?.message}`
+      });
+    }
+  }
+  
+  // 如果开启了传输功能
+  if (options.transport?.enabled) {
+    try {
+      // 导入文件传输模块
+      const { createTransportAdapter } = require('./transport');
+      transporter = createTransportAdapter(options.transport);
+    } catch (error: any) {
+      console.warn('加载传输模块失败:', error?.message);
+      failures.push({
+        type: 'transport',
+        path: 'transport.ts',
+        error: `加载传输模块失败: ${error?.message}`
+      });
+    }
+  }
+
   const processedRules: ProcessedRule[] = matchRules.map(([extensions, namePattern]) => {
     const normalizedExtensions = extensions.map((ext) =>
       ext.startsWith('.') ? ext.toLowerCase() : '.' + ext.toLowerCase()
@@ -73,6 +116,18 @@ export async function scanFiles(options: ScanOptions): Promise<ScanResult> { // 
     skippedDirs: 0,
     nestedArchivesScanned: 0,
     currentNestedLevel: 0,
+    // 添加新的进度属性
+    processedMd5Count: 0,
+    packagedFilesCount: 0,
+    transportedFilesCount: 0,
+    queueStats: fileQueue ? {
+      waiting: 0,
+      processing: 0,
+      completed: 0,
+      failed: 0,
+      retrying: 0,
+      total: 0
+    } : undefined
   };
 
   function shouldSkipDirectory(dirPath: string): boolean {
@@ -757,6 +812,341 @@ export async function scanFiles(options: ScanOptions): Promise<ScanResult> { // 
     }
   }
 
-  await scanDirectory(rootDir, 0);
-  return { results, failures }; // 返回包含结果和失败的对象
+  // 在扫描完成后处理队列
+  async function processMatchedFiles(): Promise<void> {
+    // 如果没有启用扩展功能，直接返回
+    if (!fileQueue || !options.queue?.enabled) {
+      return;
+    }
+    
+    // 如果需要检查文件稳定性
+    if (options.stabilityCheck?.enabled) {
+      try {
+        // 导入稳定性检测模块
+        const waitForFileStability = require('./stability').waitForFileStability;
+        
+        // 处理匹配队列中的文件
+        const stableFiles: FileItem[] = [];
+        const unstableFiles: FileItem[] = [];
+        
+        // 从队列中处理文件批次
+        fileQueue.processNextBatch('matched', options.queue.maxConcurrentChecks, async (batchFiles: FileItem[]) => {
+          for (const file of batchFiles) {
+            try {
+              const isStable = await waitForFileStability(file.path, options.stabilityCheck);
+              
+              if (isStable) {
+                stableFiles.push(file);
+                if (options.calculateMd5) {
+                  fileQueue.addToQueue('md5', file);
+                } else {
+                  fileQueue.addToQueue('packaging', file);
+                }
+              } else {
+                unstableFiles.push(file);
+                fileQueue.addToRetryQueue(file, 'stability');
+                failures.push({
+                  type: 'stability',
+                  path: file.path,
+                  error: '文件不稳定，添加到重试队列'
+                });
+              }
+            } catch (error: any) {
+              failures.push({
+                type: 'stability',
+                path: file.path,
+                error: `稳定性检测失败: ${error?.message}`
+              });
+              unstableFiles.push(file);
+              fileQueue.addToRetryQueue(file, 'stability');
+            }
+          }
+        });
+        
+        // 处理重试队列
+        fileQueue.processRetryQueue(async (retryFiles: FileItem[], queueType: string) => {
+          if (queueType === 'stability') {
+            for (const file of retryFiles) {
+              try {
+                const isStable = await waitForFileStability(file.path, options.stabilityCheck);
+                
+                if (isStable) {
+                  stableFiles.push(file);
+                  if (options.calculateMd5) {
+                    fileQueue.addToQueue('md5', file);
+                  } else {
+                    fileQueue.addToQueue('packaging', file);
+                  }
+                } else {
+                  unstableFiles.push(file);
+                  fileQueue.markAsFailed(file.path);
+                  failures.push({
+                    type: 'stability',
+                    path: file.path,
+                    error: '多次尝试后文件仍不稳定'
+                  });
+                }
+              } catch (error: any) {
+                failures.push({
+                  type: 'stability',
+                  path: file.path,
+                  error: `重试稳定性检测失败: ${error?.message}`
+                });
+                fileQueue.markAsFailed(file.path);
+              }
+            }
+          }
+        });
+        
+        // 更新进度信息
+        if (onProgress && fileQueue) {
+          const queueStats = fileQueue.getQueueStats();
+          if (queueStats) {
+            progress.queueStats = queueStats;
+            onProgress(progress);
+          }
+        }
+      } catch (error: any) {
+        console.warn('执行稳定性检测失败:', error?.message);
+        failures.push({
+          type: 'stability',
+          path: 'stability.ts',
+          error: `执行稳定性检测失败: ${error?.message}`
+        });
+      }
+    }
+    
+    // 如果需要计算MD5
+    if (options.calculateMd5) {
+      try {
+        // 导入MD5计算模块
+        const calculateBatchMd5 = require('./md5').calculateBatchMd5;
+        
+        // 处理MD5队列中的文件
+        const filesWithMd5: FileItem[] = [];
+        
+        fileQueue.processNextBatch('md5', options.queue.maxConcurrentChecks, async (mdFiles: FileItem[]) => {
+          try {
+            const md5ProcessedFiles = await calculateBatchMd5(mdFiles, {
+              onProgress: (_progress: number, _filePath: string) => {
+                if (onProgress) {
+                  progress.processedMd5Count = (progress.processedMd5Count || 0) + 1;
+                  onProgress(progress);
+                }
+              }
+            });
+            
+            md5ProcessedFiles.forEach((processedFile: FileItem) => {
+              filesWithMd5.push(processedFile);
+              if (options.createPackage) {
+                fileQueue.addToQueue('packaging', processedFile);
+              }
+            });
+          } catch (error: any) {
+            console.error('批量计算MD5失败:', error?.message);
+            mdFiles.forEach((failedFile: FileItem) => {
+              fileQueue.markAsFailed(failedFile.path);
+              failures.push({
+                type: 'md5',
+                path: failedFile.path,
+                error: `MD5计算失败: ${error?.message}`
+              });
+            });
+          }
+        });
+        
+        // 保存处理后的文件
+        processedFiles = filesWithMd5;
+        
+        // 更新进度信息
+        if (onProgress && fileQueue) {
+          const queueStats = fileQueue.getQueueStats();
+          if (queueStats) {
+            progress.queueStats = queueStats;
+            onProgress(progress);
+          }
+        }
+      } catch (error: any) {
+        console.warn('执行MD5计算失败:', error?.message);
+        failures.push({
+          type: 'md5',
+          path: 'md5.ts',
+          error: `执行MD5计算失败: ${error?.message}`
+        });
+      }
+    }
+    
+    // 如果需要创建打包
+    if (options.createPackage) {
+      try {
+        // 导入打包模块
+        const createBatchPackage = require('./packaging').createBatchPackage;
+        
+        // 准备打包目录
+        const tempDir = path.join(process.cwd(), 'temp');
+        await fs.ensureDir(tempDir);
+        
+        // 处理打包队列中的文件
+        const filesToPackage = fileQueue.getFilesInQueue('packaging');
+        
+        if (filesToPackage && filesToPackage.length > 0) {
+          // 生成包名
+          const date = new Date().toISOString().split('T')[0];
+          const packageName = (options.packageNamePattern || 'package_{date}_{index}')
+            .replace('{date}', date)
+            .replace('{index}', '1');
+          
+          const outputPackagePath = path.join(tempDir, `${packageName}.zip`);
+          
+          try {
+            const packagingResult = await createBatchPackage(filesToPackage, outputPackagePath, {
+              includeMd5: true,
+              includeMetadata: true,
+              onProgress: (_packProgress: any) => {
+                if (onProgress) {
+                  progress.packagedFilesCount = _packProgress.processedFiles;
+                  onProgress(progress);
+                }
+              }
+            });
+            
+            if (packagingResult.success) {
+              packagePaths.push(outputPackagePath);
+              
+              // 如果需要传输，将包添加到传输队列
+              if (options.transport?.enabled && transporter) {
+                fileQueue.addToQueue('transport', {
+                  path: outputPackagePath,
+                  name: path.basename(outputPackagePath),
+                  createTime: new Date(),
+                  modifyTime: new Date(),
+                  size: (await fs.stat(outputPackagePath)).size
+                });
+              }
+            } else {
+              failures.push({
+                type: 'packaging',
+                path: 'package',
+                error: `打包失败: ${packagingResult.error?.message}`
+              });
+            }
+          } catch (error: any) {
+            failures.push({
+              type: 'packaging',
+              path: 'package',
+              error: `打包过程发生错误: ${error?.message}`
+            });
+          }
+        }
+        
+        // 更新进度信息
+        if (onProgress && fileQueue) {
+          const queueStats = fileQueue.getQueueStats();
+          if (queueStats) {
+            progress.queueStats = queueStats;
+            onProgress(progress);
+          }
+        }
+      } catch (error: any) {
+        console.warn('执行打包失败:', error?.message);
+        failures.push({
+          type: 'packaging',
+          path: 'packaging.ts',
+          error: `执行打包失败: ${error?.message}`
+        });
+      }
+    }
+    
+    // 如果需要传输文件
+    if (options.transport?.enabled && transporter) {
+      try {
+        // 连接到服务器
+        await transporter.connect();
+        
+        // 处理传输队列中的文件
+        const filesToTransport = fileQueue.getFilesInQueue('transport');
+        
+        if (filesToTransport && filesToTransport.length > 0) {
+          for (const file of filesToTransport) {
+            try {
+              // 上传文件
+              const uploadResult = await transporter.upload(
+                file.path,
+                path.basename(file.path)
+              );
+              
+              transportResults.push(uploadResult);
+              
+              if (uploadResult.success) {
+                fileQueue.markAsCompleted(file.path);
+              } else {
+                fileQueue.markAsFailed(file.path);
+                failures.push({
+                  type: 'transport',
+                  path: file.path,
+                  error: `传输失败: ${uploadResult.error}`
+                });
+              }
+              
+              // 更新传输进度
+              if (onProgress) {
+                progress.transportedFilesCount = (progress.transportedFilesCount || 0) + 1;
+                onProgress(progress);
+              }
+            } catch (error: any) {
+              fileQueue.markAsFailed(file.path);
+              failures.push({
+                type: 'transport',
+                path: file.path,
+                error: `传输过程发生错误: ${error?.message}`
+              });
+            }
+          }
+        }
+        
+        // 断开连接
+        await transporter.disconnect();
+        
+        // 更新进度信息
+        if (onProgress && fileQueue) {
+          const queueStats = fileQueue.getQueueStats();
+          if (queueStats) {
+            progress.queueStats = queueStats;
+            onProgress(progress);
+          }
+        }
+      } catch (error: any) {
+        console.warn('执行传输失败:', error?.message);
+        failures.push({
+          type: 'transport',
+          path: 'transport.ts',
+          error: `执行传输失败: ${error?.message}`
+        });
+      }
+    }
+  }
+
+  try {
+    // 扫描根目录
+    await scanDirectory(rootDir, 0);
+    
+    // 处理匹配的文件（稳定性检测、MD5计算、打包和传输）
+    if (options.queue?.enabled) {
+      await processMatchedFiles();
+    }
+  } catch (error: any) {
+    failures.push({
+      type: 'directoryAccess',
+      path: rootDir,
+      error: error?.message || 'Unknown error',
+    });
+  }
+
+  return {
+    results,
+    failures,
+    processedFiles: processedFiles.length > 0 ? processedFiles : undefined,
+    packages: packagePaths.length > 0 ? packagePaths : undefined,
+    transportResults: transportResults.length > 0 ? transportResults : undefined
+  };
 } 

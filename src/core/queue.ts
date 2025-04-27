@@ -450,4 +450,26 @@ export class FileProcessingQueue {
   public getFailedFiles(): FileItem[] {
     return Array.from(this.failedFiles.values());
   }
+  
+  /**
+   * 获取队列中的所有文件
+   * @param queueType 队列类型
+   * @returns 文件列表
+   */
+  public getFilesInQueue(queueType: QueueType): FileItem[] {
+    switch (queueType) {
+      case 'matched':
+        return [...this.matchedQueue];
+      case 'stability':
+        return [...this.stabilityQueue];
+      case 'md5':
+        return [...this.md5Queue];
+      case 'packaging':
+        return [...this.packagingQueue];
+      case 'transport':
+        return [...this.transportQueue];
+      default:
+        return [];
+    }
+  }
 } 
