@@ -14,6 +14,8 @@
     "start": "node dist/index.js",
     "dev": "nodemon --exec ts-node src/index.ts",
     "test": "jest",
+    "test:clean": "jest --silent | ./filter-test-output.js",
+    "test:transport": "jest src/__tests__/transport_real.test.ts --silent | ./filter-test-output.js",
     "lint": "eslint . --ext .ts",
     "format": "prettier --write \"src/**/*.ts\"",
     "prepublishOnly": "npm run build",

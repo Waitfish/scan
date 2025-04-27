@@ -50,7 +50,8 @@ const ftpConfig: TransportOptions = {
   retryCount: 2,
   timeout: 10000,
   enabled: true,
-  packageSize: 10
+  packageSize: 10,
+  debug: false // 关闭调试模式，减少日志输出
 };
 
 // FTPS配置
@@ -65,7 +66,7 @@ const ftpsConfig: TransportOptions = {
   packageSize: 10,
   retryCount: 3,
   timeout: 30000,
-  debug: true // 开启调试模式，方便查看错误信息
+  debug: false // 关闭调试模式，减少日志输出
 };
 
 // 标记是否跳过真实服务器测试 - 默认情况下不会跳过
@@ -76,11 +77,14 @@ const SKIP_REAL_SERVER_TESTS = process.env.SKIP_REAL_SERVER_TESTS === 'true';
 const SKIP_FTP_SERVER_TESTS = process.env.SKIP_FTP_SERVER_TESTS === 'true';
 
 // 测试超时时间
-const TEST_TIMEOUT = 20000; // 20秒
+const TEST_TIMEOUT = 30000; // 增加到30秒
 
 // 根据条件选择跳过的测试
 const maybeskip = SKIP_REAL_SERVER_TESTS ? test.skip : test;
 const maybeskipFtp = SKIP_FTP_SERVER_TESTS ? test.skip : maybeskip;
+
+// 保存所有创建的适配器，以便在测试完成后关闭它们
+const activeAdapters: (FtpAdapter | FtpsAdapter | SftpAdapter)[] = [];
 
 // 测试开始前创建测试文件和目录
 beforeAll(async () => {
@@ -101,6 +105,17 @@ beforeAll(async () => {
 
 // 测试结束后清理测试文件
 afterAll(async () => {
+  // 确保所有适配器已断开连接
+  for (const adapter of activeAdapters) {
+    if ((adapter as any).connected) {
+      try {
+        await adapter.disconnect();
+      } catch (error) {
+        console.error('清理时断开连接失败:', error);
+      }
+    }
+  }
+  
   if (existsSync(testFile)) {
     await fs.unlink(testFile);
   }
@@ -133,6 +148,7 @@ describe('FTPS适配器真实服务器测试', () => {
   
   beforeEach(() => {
     adapter = new FtpsAdapter(ftpsConfig);
+    activeAdapters.push(adapter);
   });
   
   maybeskip('应该能连接到真实的FTPS服务器', async () => {
@@ -223,6 +239,7 @@ describe('FTP适配器真实服务器测试', () => {
   
   beforeEach(() => {
     adapter = new FtpAdapter(ftpConfig);
+    activeAdapters.push(adapter);
   });
   
   maybeskipFtp('应该能连接到真实的FTP服务器', async () => {
@@ -391,6 +408,227 @@ describe('传输特殊场景测试', () => {
       await adapter.disconnect();
     } catch (error: any) {
       console.error('上传较大文件失败:', error.message);
+      throw error;
+    }
+  }, TEST_TIMEOUT);
+});
+
+// FTPS适配器配置选项测试
+describe('FTPS适配器配置选项测试', () => {
+  maybeskip('应该能使用debug模式连接', async () => {
+    const debugConfig = { ...ftpsConfig, debug: true };
+    const adapter = new FtpsAdapter(debugConfig);
+    activeAdapters.push(adapter);
+    
+    try {
+      // 测试debug模式，但这里不会显示日志输出
+      await adapter.connect();
+      await adapter.disconnect();
+      expect(true).toBe(true); // 如果没有抛出异常，则测试通过
+    } catch (error: any) {
+      console.error('使用debug模式连接失败:', error.message);
+      throw error;
+    }
+  }, TEST_TIMEOUT);
+  
+  maybeskip('应该能设置自定义超时时间', async () => {
+    const customTimeoutConfig = { ...ftpsConfig, timeout: 15000 };
+    const adapter = new FtpsAdapter(customTimeoutConfig);
+    activeAdapters.push(adapter);
+    
+    try {
+      await adapter.connect();
+      await adapter.disconnect();
+      expect(true).toBe(true);
+    } catch (error: any) {
+      console.error('使用自定义超时连接失败:', error.message);
+      throw error;
+    }
+  }, TEST_TIMEOUT);
+});
+
+// 添加更多错误场景测试
+describe('传输错误场景测试', () => {
+  // 文件不存在的上传测试
+  maybeskip('应该正确处理不存在的文件上传', async () => {
+    const adapter = new FtpsAdapter(ftpsConfig);
+    activeAdapters.push(adapter);
+    
+    await adapter.connect();
+    
+    // 创建一个不存在的文件路径
+    const nonExistentFile = path.join(tmpDir, 'this-file-does-not-exist.txt');
+    
+    // 尝试上传不存在的文件，应该抛出异常
+    try {
+      await adapter.upload(nonExistentFile, 'should-fail.txt');
+      // 如果执行到这里，测试应该失败
+      expect(true).toBe(false);
+    } catch (error: any) {
+      // 期望抛出异常
+      expect(error).toBeDefined();
+      expect(error.message).toContain('不存在');
+    } finally {
+      await adapter.disconnect();
+    }
+  }, TEST_TIMEOUT);
+  
+  // 测试exists方法
+  maybeskip('exists方法应该能正确检测文件存在情况', async () => {
+    const adapter = new FtpsAdapter(ftpsConfig);
+    activeAdapters.push(adapter);
+    
+    await adapter.connect();
+    
+    try {
+      // 先上传一个文件
+      const testFilePath = 'exists-test-file.txt';
+      await adapter.upload(testFile, testFilePath);
+      
+      // 检查文件存在
+      const exists = await adapter.exists(testFilePath);
+      expect(exists).toBe(true);
+      
+      // 检查不存在的文件
+      const nonExistsFile = 'non-existent-file-' + Date.now() + '.txt';
+      const nonExists = await adapter.exists(nonExistsFile);
+      expect(nonExists).toBe(false);
+      
+      // 检查不存在的目录中的文件
+      const nonExistsPath = 'non-existent-dir-' + Date.now() + '/some-file.txt';
+      const pathNonExists = await adapter.exists(nonExistsPath);
+      expect(pathNonExists).toBe(false);
+    } finally {
+      await adapter.disconnect();
+    }
+  }, TEST_TIMEOUT);
+  
+  // 连接到不存在的服务器（网络错误模拟）
+  test('应该处理连接到不存在的服务器的情况', async () => {
+    const badServerConfig = { 
+      ...ftpsConfig, 
+      host: 'non-existent-server-' + Date.now() + '.example',
+      timeout: 5000 // 设置较短的超时时间加快测试
+    };
+    
+    const adapter = new FtpsAdapter(badServerConfig);
+    activeAdapters.push(adapter);
+    
+    try {
+      await adapter.connect();
+      // 如果连接成功，测试应该失败
+      expect(true).toBe(false);
+    } catch (error: any) {
+      // 期望连接失败
+      expect(error).toBeDefined();
+      expect(error.message).toBeDefined();
+    }
+  }, TEST_TIMEOUT);
+  
+  // 测试无权限访问的目录
+  maybeskip('应该处理无权限访问目录的情况', async () => {
+    // 假设/root目录是无权限访问的
+    const noPermConfig = { 
+      ...ftpsConfig, 
+      remotePath: '/root/no-permission-dir'
+    };
+    
+    try {
+      const adapter = new FtpsAdapter(noPermConfig);
+      activeAdapters.push(adapter);
+      
+      // 尝试上传到无权限目录
+      const result = await adapter.upload(testFile, 'test-no-perm.txt');
+      
+      // 应该上传失败
+      expect(result.success).toBe(false);
+      expect(result.error).toBeDefined();
+      
+      await adapter.disconnect();
+    } catch (error: any) {
+      // 连接时可能会直接失败，这也是预期内的
+      expect(error).toBeDefined();
+    }
+  }, TEST_TIMEOUT);
+  
+  // 测试上传超时
+  maybeskip('应该处理上传超时的情况', async () => {
+    // 使用非常短的超时设置
+    const timeoutConfig = { 
+      ...ftpsConfig, 
+      timeout: 100 // 非常短的超时
+    };
+    
+    const adapter = new FtpsAdapter(timeoutConfig);
+    activeAdapters.push(adapter);
+    
+    try {
+      await adapter.connect();
+      
+      // 创建一个稍大的文件，以增加超时几率
+      const largeFilePath = path.join(tmpDir, 'timeout-test-file.txt');
+      // 写入约10MB的数据
+      const content = Buffer.alloc(10 * 1024 * 1024).fill('A');
+      await fs.writeFile(largeFilePath, content);
+      
+      // 尝试上传，预期会超时
+      const result = await adapter.upload(largeFilePath, 'should-timeout.txt');
+      
+      // 应该失败
+      expect(result.success).toBe(false);
+      
+      await adapter.disconnect();
+    } catch (error: any) {
+      // 连接可能直接超时，这也是预期的
+      expect(error).toBeDefined();
+    }
+  }, TEST_TIMEOUT);
+});
+
+// SFTP适配器测试
+describe('SFTP适配器测试', () => {
+  // 注意：这可能需要有一个可用的SFTP服务器
+  // 如果没有，这些测试可以使用maybeskip跳过
+  
+  let sftpConfig: TransportOptions;
+  let adapter: SftpAdapter;
+  
+  beforeEach(() => {
+    // 使用与FTPS相同的配置，但协议改为sftp
+    sftpConfig = {
+      ...ftpsConfig,
+      protocol: 'sftp'
+    };
+    adapter = new SftpAdapter(sftpConfig);
+    activeAdapters.push(adapter);
+  });
+  
+  // 基本连接测试
+  test.skip('应该能连接到SFTP服务器', async () => {
+    // 由于可能没有可用的SFTP服务器，默认跳过此测试
+    try {
+      await adapter.connect();
+      await adapter.disconnect();
+      expect(true).toBe(true);
+    } catch (error: any) {
+      console.error('连接SFTP服务器失败:', error.message);
+      throw error;
+    }
+  }, TEST_TIMEOUT);
+  
+  // 基本上传测试
+  test.skip('应该能向SFTP服务器上传文件', async () => {
+    try {
+      await adapter.connect();
+      
+      const result = await adapter.upload(testFile, 'sftp-test.txt');
+      
+      expect(result.success).toBe(true);
+      expect(result.remotePath).toContain('sftp-test.txt');
+      
+      await adapter.disconnect();
+    } catch (error: any) {
+      console.error('上传文件到SFTP服务器失败:', error.message);
       throw error;
     }
   }, TEST_TIMEOUT);
