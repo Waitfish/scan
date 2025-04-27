@@ -2,6 +2,8 @@
  * @file 类型定义
  */
 
+import { PackagingTriggerOptions } from './facade'; // Import from facade temporarily
+
 export interface FileItem {
   /** 文件绝对路径 (对于压缩包内文件，指压缩包的路径) */
   path: string;
@@ -119,6 +121,10 @@ export interface ScanOptions {
   createPackage?: boolean;
   /** 压缩包命名模式（支持日期变量如{date}） */
   packageNamePattern?: string;
+  /** 打包文件输出目录 */
+  outputDir?: string;
+  /** 打包触发选项 */
+  packagingTrigger?: PackagingTriggerOptions;
 }
 
 export interface ScanProgress {
@@ -162,7 +168,7 @@ export interface ScanProgress {
  */
 export interface FailureItem {
   /** 失败类型 */
-  type: 'directoryAccess' | 'fileStat' | 'archiveOpen' | 'archiveEntry' | 'rarOpen' | 'nestedArchive' | 'stability' | 'md5' | 'packaging' | 'transport';
+  type: 'directoryAccess' | 'fileStat' | 'archiveOpen' | 'archiveEntry' | 'rarOpen' | 'nestedArchive' | 'stability' | 'md5' | 'packaging' | 'transport' | 'scanError';
   /** 发生失败的文件、目录或压缩包的路径 */
   path: string;
   /** 如果是压缩包内条目处理失败，这里是内部路径 */

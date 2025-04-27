@@ -9,3 +9,4 @@ export * from './core/packaging';
 export * from './core/transport';
 export * from './core/queue';
 export * from './types';
+export * from './facade';
