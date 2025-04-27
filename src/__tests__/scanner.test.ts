@@ -232,12 +232,13 @@ describe('文件扫描器', () => {
       expect(lastProgress.archivesScanned).toBe(expectedArchiveScanCount);
     });
 
-    test.skip('跳过目录时，不应扫描其中的压缩包', async () => {
+    test('跳过目录时，不应扫描其中的压缩包', async () => {
       const skippedZipPath = path.join(testDir, 'skip-this', 'skipped-archive.zip');
       const zipStream = new compressing.zip.Stream();
-      zipStream.addEntry(Buffer.from('should not be found'), { relativePath: 'internal-match.txt' });
+      zipStream.addEntry(Buffer.from('should be skipped'), { relativePath: 'skip-inside.txt' });
       const destStream = fs.createWriteStream(skippedZipPath);
-      await new Promise<void>((res, rej) => zipStream.pipe(destStream).on('finish', res).on('error', rej));
+      await new Promise<void>((resolve) => zipStream.pipe(destStream).on('finish', resolve));
+      
       const { results, failures } = await scanFiles({ ...baseOptions, skipDirs: ['skip-this'] });
       expect(failures).toHaveLength(0);
       expect(results.some(f => f.archivePath === skippedZipPath)).toBe(false);

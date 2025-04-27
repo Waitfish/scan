@@ -20,12 +20,17 @@ jest.mock('fs', () => {
   const original = jest.requireActual('fs');
   return {
     ...original,
-    createReadStream: jest.fn()
+    createReadStream: jest.fn().mockImplementation((filePath, options) => {
+      // 使用真实的 createReadStream 创建流，避免流为undefined的问题
+      const stream = original.createReadStream(filePath, options);
+      // 返回原始流
+      return stream;
+    })
   };
 });
 
 // 导入fs模块
-import * as fsNode from 'fs'; // 引入原生fs模块
+// import * as fsNode from 'fs'; // 引入原生fs模块
 
 const TEST_DIR = path.join(os.tmpdir(), 'scan-md5-test');
 
@@ -364,6 +369,283 @@ describe('MD5计算', () => {
         // 恢复原始函数
         require('fs').createReadStream = originalCreateReadStream;
       }
+    });
+
+    // 新增测试用例 - 计算空文件的MD5
+    test('计算空文件的MD5', async () => {
+      const emptyFile = path.join(TEST_DIR, 'empty-file.txt');
+      await fs.writeFile(emptyFile, ''); // 创建空文件
+      
+      // 空文件的标准MD5值
+      const expectedMd5 = 'd41d8cd98f00b204e9800998ecf8427e';
+      
+      const md5 = await calculateMd5(emptyFile);
+      expect(md5).toBe(expectedMd5);
+    });
+    
+    // 新增测试用例 - 测试禁用流处理选项
+    test('禁用流处理选项', async () => {
+      const testFile = path.join(TEST_DIR, 'no-stream.txt');
+      const content = 'test content for disabled stream processing';
+      await fs.writeFile(testFile, content);
+      
+      const expectedMd5 = crypto.createHash('md5').update(content).digest('hex');
+      
+      // 强制使用非流式处理，即使文件较大
+      const md5 = await calculateMd5(testFile, {
+        useStreamProcessing: false,
+        largeFileThreshold: 1 // 设置极小的阈值，但由于禁用了流处理，不会使用流
+      });
+      
+      expect(md5).toBe(expectedMd5);
+    });
+    
+    // 新增测试用例 - 测试calculateOptimizedMd5函数的大文件分支
+    test('优化的MD5计算 - 大文件策略', async () => {
+      // 模拟文件大小介于10MB-1GB之间的情况
+      const testFile = path.join(TEST_DIR, 'medium-optimized.txt');
+      // 为了测试方便，我们只创建一个小文件，但模拟其stats的大小
+      await fs.writeFile(testFile, 'medium file content');
+      
+      // 保存并模拟fs.promises.stat方法
+      const originalStat = fs.promises.stat;
+      fs.promises.stat = jest.fn().mockResolvedValue({
+        size: 20 * 1024 * 1024, // 20MB
+        isFile: () => true,
+        isDirectory: () => false,
+        isSymbolicLink: () => false
+      });
+      
+      try {
+        // 计算预期的MD5
+        const expectedMd5 = crypto.createHash('md5').update('medium file content').digest('hex');
+        
+        // 使用优化的MD5计算
+        const md5 = await calculateOptimizedMd5(testFile);
+        
+        expect(md5).toBe(expectedMd5);
+      } finally {
+        // 恢复原始函数
+        fs.promises.stat = originalStat;
+      }
+    });
+    
+    // 新增测试用例 - 测试calculateOptimizedMd5函数的超大文件分支
+    test('优化的MD5计算 - 超大文件策略', async () => {
+      // 模拟文件大小超过1GB的情况
+      const testFile = path.join(TEST_DIR, 'large-optimized.txt');
+      // 为了测试方便，我们只创建一个小文件，但模拟其stats的大小
+      await fs.writeFile(testFile, 'very large file content');
+      
+      // 保存并模拟fs.promises.stat方法
+      const originalStat = fs.promises.stat;
+      fs.promises.stat = jest.fn().mockResolvedValue({
+        size: 2 * 1024 * 1024 * 1024, // 2GB
+        isFile: () => true,
+        isDirectory: () => false,
+        isSymbolicLink: () => false
+      });
+      
+      try {
+        // 计算预期的MD5
+        const expectedMd5 = crypto.createHash('md5').update('very large file content').digest('hex');
+        
+        // 使用优化的MD5计算
+        const md5 = await calculateOptimizedMd5(testFile);
+        
+        expect(md5).toBe(expectedMd5);
+      } finally {
+        // 恢复原始函数
+        fs.promises.stat = originalStat;
+      }
+    });
+    
+    // 新增测试用例 - 测试带有filePath的进度回调
+    test('进度回调应该包含文件路径', async () => {
+      const testFile = path.join(TEST_DIR, 'progress-path-test.txt');
+      const buffer = Buffer.alloc(1024 * 5, 'y'); // 5KB
+      await fs.writeFile(testFile, buffer);
+      
+      // 路径和进度记录
+      const progressPaths: string[] = [];
+      const progressValues: number[] = [];
+      
+      const options: Md5Options = {
+        useStreamProcessing: true,
+        largeFileThreshold: 1024, // 1KB
+        onProgress: (progress, filePath) => {
+          // 记录传递给回调的文件路径和进度值
+          progressPaths.push(filePath);
+          progressValues.push(progress);
+        }
+      };
+      
+      await calculateMd5(testFile, options);
+      
+      // 确保回调中提供了正确的文件路径
+      expect(progressPaths.length).toBeGreaterThan(0);
+      expect(progressPaths[0]).toBe(testFile);
+      // 检查是否有进度值
+      expect(progressValues.length).toBeGreaterThan(0);
+    });
+    
+    // 新增测试用例 - 测试手动设置并发数的批量计算
+    test('批量计算MD5 - 指定具体并发数', async () => {
+      // 创建一个测试文件
+      const testFile = path.join(TEST_DIR, 'concurrency-test.txt');
+      await fs.writeFile(testFile, 'concurrency test content');
+      
+      const stats = await fs.stat(testFile);
+      const fileItem: FileItem = {
+        path: testFile,
+        name: path.basename(testFile),
+        size: stats.size,
+        createTime: stats.birthtime,
+        modifyTime: stats.mtime
+      };
+      
+      // 明确指定并发数为1
+      const updatedItems = await calculateBatchMd5([fileItem], {}, 1);
+      
+      // 验证计算结果
+      expect(updatedItems[0].md5).toBeDefined();
+    });
+
+    // 添加大文件测试套件
+    describe('真实大文件测试', () => {
+      const testDir = path.join(__dirname, '../../temp-test');
+      const smallFile = path.join(testDir, 'small-test-file.dat');
+      const mediumFile = path.join(testDir, 'medium-test-file.dat');
+      const largeFile = path.join(testDir, 'large-test-file.dat');
+      
+      const KB = 1024;
+      const MB = 1024 * KB;
+      const SMALL_SIZE = 1 * MB;
+      const MEDIUM_SIZE = 10 * MB;
+      // 测试文件太小时，会导致和进度回调相关的测试失败
+      const LARGE_SIZE = 1000 * MB;
+
+      beforeEach(async () => {
+        // 确保测试目录存在
+        if (!fs.existsSync(testDir)) {
+          await fs.promises.mkdir(testDir, { recursive: true });
+        }
+      });
+
+      afterAll(async () => {
+        // 测试完成后清理文件
+        if (fs.existsSync(smallFile)) await fs.promises.unlink(smallFile);
+        if (fs.existsSync(mediumFile)) await fs.promises.unlink(mediumFile);
+        if (fs.existsSync(largeFile)) await fs.promises.unlink(largeFile);
+        
+        // 尝试删除测试目录
+        try {
+          await fs.promises.rmdir(testDir);
+        } catch (err) {
+          console.warn('无法删除测试目录', err);
+        }
+      });
+
+      /**
+       * 创建指定大小的测试文件
+       */
+      async function createTestFile(filePath: string, sizeInBytes: number): Promise<void> {
+        return new Promise((resolve, reject) => {
+          const writeStream = fs.createWriteStream(filePath);
+          let bytesWritten = 0;
+          const chunkSize = 1 * MB; // 每次写入1MB
+          
+          const writeChunk = () => {
+            const remainingBytes = sizeInBytes - bytesWritten;
+            if (remainingBytes <= 0) {
+              writeStream.end(() => resolve());
+              return;
+            }
+            
+            const currentChunkSize = Math.min(chunkSize, remainingBytes);
+            // 创建有规律的数据块，以便MD5值可以被验证
+            const buffer = Buffer.alloc(currentChunkSize);
+            for (let i = 0; i < currentChunkSize; i++) {
+              buffer[i] = (bytesWritten + i) % 256;
+            }
+            
+            const canContinue = writeStream.write(buffer);
+            bytesWritten += currentChunkSize;
+            
+            if (canContinue) {
+              process.nextTick(writeChunk);
+            } else {
+              writeStream.once('drain', writeChunk);
+            }
+          };
+          
+          writeStream.on('error', reject);
+          writeChunk();
+        });
+      }
+
+      // 跳过真正的大文件测试，因为它们会花费很长时间
+      // 如果需要运行这些测试，可以删除 .skip
+      test('创建并验证1MB测试文件', async () => {
+        await createTestFile(smallFile, SMALL_SIZE);
+        
+        expect(fs.existsSync(smallFile)).toBe(true);
+        const stats = await fs.promises.stat(smallFile);
+        expect(stats.size).toBe(SMALL_SIZE);
+        
+        // 计算并验证MD5
+        const md5 = await calculateMd5(smallFile);
+        expect(md5).toMatch(/^[a-f0-9]{32}$/); // 应该是一个有效的MD5哈希
+        
+        console.log(`1MB文件MD5: ${md5}`);
+      }, 30000);
+      
+      test('创建并验证10MB测试文件', async () => {
+        await createTestFile(mediumFile, MEDIUM_SIZE);
+        
+        expect(fs.existsSync(mediumFile)).toBe(true);
+        const stats = await fs.promises.stat(mediumFile);
+        expect(stats.size).toBe(MEDIUM_SIZE);
+        
+        // 计算并验证MD5
+        const md5Standard = await calculateMd5(mediumFile, { useStreamProcessing: false });
+        const md5Stream = await calculateMd5(mediumFile, { useStreamProcessing: true });
+        
+        // 两种方法计算的MD5应该相同
+        expect(md5Standard).toMatch(/^[a-f0-9]{32}$/);
+        expect(md5Stream).toMatch(/^[a-f0-9]{32}$/);
+        expect(md5Standard).toBe(md5Stream);
+        
+        console.log(`10MB文件MD5: ${md5Standard}`);
+      }, 60000);
+      
+      test('创建并验证100MB测试文件', async () => {
+        await createTestFile(largeFile, LARGE_SIZE);
+        
+        expect(fs.existsSync(largeFile)).toBe(true);
+        const stats = await fs.promises.stat(largeFile);
+        expect(stats.size).toBe(LARGE_SIZE);
+        
+        // 记录进度更新
+        const progressUpdates: number[] = [];
+        
+        // 计算并验证MD5
+        const md5 = await calculateMd5(largeFile, {
+          useStreamProcessing: true,
+          onProgress: (progress) => {
+            progressUpdates.push(progress);
+          }
+        });
+        
+        expect(md5).toMatch(/^[a-f0-9]{32}$/);
+        
+        // 验证进度回调
+        expect(progressUpdates.length).toBeGreaterThan(0);
+        expect(progressUpdates[progressUpdates.length - 1]).toBe(100);
+        
+        console.log(`100MB文件MD5: ${md5}`);
+        console.log(`进度更新次数: ${progressUpdates.length}`);
+      }, 120000);
     });
   });
 }); 
