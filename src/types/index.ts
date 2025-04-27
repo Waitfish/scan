@@ -63,13 +63,13 @@ export interface QueueOptions {
 }
 
 /**
- * 传输选项
+ * 传输配置选项
  */
 export interface TransportOptions {
-  /** 是否启用传输功能 */
+  /** 是否启用传输 */
   enabled: boolean;
   /** 传输协议 */
-  protocol: 'ftp' | 'sftp';
+  protocol: 'ftp' | 'sftp' | 'ftps';
   /** 服务器主机 */
   host: string;
   /** 服务器端口 */
@@ -78,14 +78,16 @@ export interface TransportOptions {
   username: string;
   /** 密码 */
   password: string;
-  /** 远程路径 */
+  /** 远程目录路径 */
   remotePath: string;
-  /** 每个包最多包含的文件数 */
+  /** 每个压缩包最多包含的文件数 */
   packageSize: number;
   /** 重试次数 */
   retryCount: number;
-  /** 超时时间（毫秒） */
+  /** 超时时间(毫秒) */
   timeout: number;
+  /** 是否开启调试模式 */
+  debug?: boolean;
 }
 
 export interface ScanOptions {

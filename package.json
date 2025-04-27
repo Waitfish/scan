@@ -29,11 +29,11 @@
     "url": "https://github.com/waitfish/scan.git"
   },
   "dependencies": {
+    "basic-ftp": "^5.0.5",
     "compressing": "^1.10.1",
     "fs-extra": "^11.3.0",
     "node-unrar-js": "^2.0.2",
-    "ssh2-sftp-client": "^9.1.0",
-    "ftp-srv": "^4.6.2"
+    "ssh2-sftp-client": "^9.1.0"
   },
   "devDependencies": {
     "@types/adm-zip": "^0.5.7",
