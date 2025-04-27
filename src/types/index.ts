@@ -172,6 +172,62 @@ export interface FailureItem {
 }
 
 /**
+ * 文件元数据项
+ */
+export interface FileMetadata {
+  /** 文件名 */
+  name: string;
+  /** 文件大小（字节） */
+  size: number;
+  /** 文件创建时间（ISO字符串） */
+  createTime?: string;
+  /** 文件修改时间（ISO字符串） */
+  modifyTime?: string;
+  /** 文件MD5校验和（如果包含） */
+  md5?: string;
+}
+
+/**
+ * FileItem的序列化版本（用于元数据存储）
+ */
+export type SerializedFileItem = Omit<FileItem, 'createTime' | 'modifyTime'> & {
+  /** 序列化后的创建时间 */
+  createTime?: string;
+  /** 序列化后的修改时间 */
+  modifyTime?: string;
+};
+
+/**
+ * 错误元数据项
+ */
+export interface ErrorMetadata {
+  /** 文件名 */
+  file: string;
+  /** 错误消息 */
+  error: string;
+}
+
+/**
+ * 包元数据
+ */
+export interface PackageMetadata {
+  /** 创建时间（ISO字符串） */
+  createdAt: string;
+  /** 包含的文件列表 */
+  files: SerializedFileItem[];
+  /** 元数据版本 */
+  version?: string;
+  /** 包唯一标识符 */
+  packageId?: string;
+  /** 标签列表 */
+  tags?: string[];
+  /** 使用的校验算法 */
+  checksumAlgorithm?: string;
+  /** 错误记录（如果有） */
+  errors?: ErrorMetadata[];
+}
+
+/**
  * scanFiles 函数的返回结果
  */
 export interface ScanResult {
