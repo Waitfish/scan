@@ -464,7 +464,6 @@ export async function scanAndTransport(config: ScanAndTransportConfig): Promise<
               // 将文件标记为已完成处理并添加到MD5队列
               queue.markAsCompleted(file.path);
               queue.addToQueue('md5', file);
-              processedFiles.push(file);
               await logToFile(logFilePath, `文件稳定性检测完成: ${file.path} (大小: ${stats.size} 字节)`);
             } else {
               // 文件不稳定，加入重试队列
@@ -567,7 +566,6 @@ export async function scanAndTransport(config: ScanAndTransportConfig): Promise<
                 // 将文件标记为已完成处理并添加到MD5队列
                 queue.markAsCompleted(file.path);
                 queue.addToQueue('md5', file);
-                processedFiles.push(file);
                 await logToFile(logFilePath, `压缩文件稳定性检测和提取完成: ${file.path} (大小: ${stats.size} 字节)`);
               } catch (error: any) {
                 await logToFile(logFilePath, `压缩文件提取失败: ${file.path}, 错误: ${error.message}`);
@@ -625,6 +623,8 @@ export async function scanAndTransport(config: ScanAndTransportConfig): Promise<
     if (!calculateMd5) {
       // 如果不需要计算MD5，则将文件直接添加到打包队列
       queue.getFilesInQueue('md5').forEach(file => {
+        // Also add to processed files here, as it skips the MD5 processor
+        processedFiles.push(file);
         queue.addToQueue('packaging', file);
       });
       await logToFile(logFilePath, `MD5计算被禁用，直接添加到打包队列`);
@@ -639,14 +639,14 @@ export async function scanAndTransport(config: ScanAndTransportConfig): Promise<
           // 单独处理每个文件
           for (const file of files) {
             try {
-              // 计算MD5
+              // Calculate MD5
               const updatedFile = await calculateFileMd5(file);
-              
+
+              // Add to processed files *after* MD5 calculation
+              processedFiles.push(updatedFile);
+
               // 将文件添加到打包队列
               queue.addToQueue('packaging', updatedFile);
-              
-              // 添加到处理过的文件列表
-              processedFiles.push(updatedFile);
               
               await logToFile(logFilePath, `MD5计算完成: ${file.path}`);
             } catch (fileError: any) {

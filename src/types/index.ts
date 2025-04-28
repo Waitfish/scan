@@ -201,6 +201,7 @@ export interface FailureItem {
   /** 发生失败的文件、目录或压缩包的路径 */
   path: string;
   /** 如果是压缩包内条目处理失败，这里是内部路径 */
+  // TODO: 改成和FileItem 一样的
   entryPath?: string;
   /** 具体的错误信息 */
   error: string;
