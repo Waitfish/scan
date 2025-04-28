@@ -6,7 +6,6 @@ import * as path from 'path';
 import { scanFiles } from './core/scanner';
 import { FileProcessingQueue } from './core/queue';
 import * as fs from 'fs-extra';
-import * as crypto from 'crypto';
 import * as os from 'os';
 import { createBatchPackage } from './core/packaging';
 // 导入core模块下的关键功能
@@ -58,7 +57,10 @@ const DEFAULT_STABILITY_CONFIG: StabilityConfig = {
     enabled: true,
     checkInterval: 1000,
     maxRetries: 3,
-    keepTempFiles: false
+    keepTempFiles: false,
+    // Add missing properties based on potential usage in stability worker
+    skipLargeFiles: false,
+    largeFileThreshold: undefined
   }
 };
 const DEFAULT_QUEUE_CONFIG: QueueConfig = {
@@ -71,6 +73,9 @@ const DEFAULT_QUEUE_CONFIG: QueueConfig = {
 };
 const DEFAULT_TRANSPORT_RETRY_COUNT = 3;
 const DEFAULT_TRANSPORT_TIMEOUT = 60000; // 60 秒
+
+// 全局停止标志
+let stopWorkers = false;
 
 // 生成带时间戳的默认日志文件名
 /* istanbul ignore next */ // 忽略测试覆盖率，因为它在测试中被单独测试
@@ -105,967 +110,955 @@ async function saveResultToFile(filePath: string, data: any): Promise<void> {
   }
 }
 
-/**
- * 执行扫描、打包和传输的简化流程函数
- * @param config 配置对象
- * @returns 包含处理结果和日志路径的对象
- */
-export async function scanAndTransport(config: ScanAndTransportConfig): Promise<ScanAndTransportResult> {
-  // 记录开始时间
-  const startTime = new Date();
-  
-  // 1. 合并配置与默认值
-  const taskId = config.taskId || crypto.randomUUID(); // 使用提供的任务ID或生成新的
-  const scanId = `scan_${startTime.getTime()}`; // 基于时间戳创建扫描ID
-  
-  const outputDir = path.resolve(config.outputDir ?? DEFAULT_OUTPUT_DIR);
-  const resultsDir = path.resolve(config.resultsDir ?? DEFAULT_RESULTS_DIR);
-  const packageNamePattern = config.packageNamePattern ?? DEFAULT_PACKAGE_NAME_PATTERN;
-  const maxFileSize = config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE;
-  const skipDirs = config.skipDirs ?? DEFAULT_SKIP_DIRS;
-  const depth = config.depth ?? DEFAULT_DEPTH;
-  const scanNestedArchives = config.scanNestedArchives ?? DEFAULT_SCAN_NESTED_ARCHIVES;
-  const maxNestedLevel = config.maxNestedLevel ?? DEFAULT_MAX_NESTED_LEVEL;
-  const packagingTrigger = { ...DEFAULT_PACKAGING_TRIGGER, ...config.packagingTrigger };
-  const logFilePath = config.logFilePath ? path.resolve(config.logFilePath) : getDefaultLogFilePath();
-  const calculateMd5 = config.calculateMd5 !== undefined ? config.calculateMd5 : true;
+// --- Worker 函数实现 ---
 
-  // 2. 准备队列配置
-  const queueConfig: QueueConfig = {
-    ...DEFAULT_QUEUE_CONFIG,
-    ...config.queue
-  };
-  
-  // 3. 准备稳定性配置
-  const stabilityConfig: StabilityConfig = {
-    ...DEFAULT_STABILITY_CONFIG,
-    ...config.stability
-  };
-  
-  // 4. 初始化日志
-  await fs.ensureDir(path.dirname(logFilePath));
-  await logToFile(logFilePath, `--- ScanAndTransport Start ---`);
-  await logToFile(logFilePath, `任务ID: ${taskId}, 扫描ID: ${scanId}`);
-  await logToFile(logFilePath, `开始时间: ${startTime.toISOString()}`);
-  await logToFile(logFilePath, `配置: ${JSON.stringify({
-    rootDir: config.rootDir,
-    rulesCount: config.rules.length,
-    outputDir,
-    resultsDir,
-    skipDirs,
-    depth,
-    maxFileSize,
-    scanNestedArchives,
-    calculateMd5
-  })}`);
+// 2. Define isQueueTrulyIdle helper function
+function isQueueTrulyIdle(queue: FileProcessingQueue): boolean {
+  const stats = queue.getDetailedQueueStats();
+  const packagingProcessing = queue.getProcessingSet('packaging')?.size ?? 0; // Packaging has no dedicated processing stat
+  const transportProcessing = queue.getProcessingSet('transport')?.size ?? 0; // Check processing set for transport
 
-  // 5. 初始化文件处理队列
-  const queue = new FileProcessingQueue(queueConfig, stabilityConfig);
-  await logToFile(logFilePath, `队列系统初始化完成`);
-  
-  // 6. 收集结果和失败项
-  const matchedFiles: FileItem[] = [];
-  const processedFiles: FileItem[] = [];
-  const failedItems: FailureItem[] = [];
-  const packagePaths: string[] = [];
-  const transportResults: {
-    success: boolean;
-    filePath: string;
-    remotePath: string;
-    error?: string;
-  }[] = [];
-  
-  // 用于存储最终结果的对象
-  const result: ScanAndTransportResult = {
-    success: false,
-    processedFiles: [],
-    failedItems: [],
-    packagePaths: [],
-    transportSummary: [],
-    logFilePath,
-    taskId,
-    scanId,
-    resultFilePath: getResultFilePath(resultsDir, taskId, scanId),
-    startTime,
-    endTime: new Date(), // 临时值，将在处理完成后更新
-    elapsedTimeMs: 0 // 临时值，将在处理完成后更新
-  };
-  
-  try {
-    // 7. 构建扫描选项
-    const scanOptions: ScanOptions = {
-      rootDir: path.resolve(config.rootDir),
-      matchRules: config.rules,
-      depth,
-      maxFileSize,
-      skipDirs: skipDirs.map(dir => path.resolve(config.rootDir, dir)),
-      scanNestedArchives,
-      maxNestedLevel,
-      taskId,
-      onProgress: (progress) => {
-        // 更新进度信息
-        if (config.onProgress) {
-          config.onProgress(progress);
-        }
-      },
-      onFileMatched: (file, progress) => {
-        // 当文件匹配时，添加到队列管理系统
-        matchedFiles.push(file);
-        queue.addToMatchedQueue(file);
-        
-        // 如果有外部进度回调，调用它
-        if (config.onProgress) {
-          config.onProgress(progress, file);
-        }
-      },
-      onFailure: (failure, progress) => {
-        // 记录扫描失败项
-        failedItems.push(failure);
-        
-        // 记录到日志
-        logToFile(logFilePath, `扫描失败: ${failure.path}, 类型: ${failure.type}, 错误: ${failure.error}`);
-        
-        // 如果有外部进度回调，调用它
-        if (config.onProgress) {
-          config.onProgress(progress);
-        }
-      }
+  return (
+    stats.fileStability.waiting === 0 && stats.fileStability.processing === 0 &&
+    stats.archiveStability.waiting === 0 && stats.archiveStability.processing === 0 &&
+    stats.md5.waiting === 0 && stats.md5.processing === 0 &&
+    stats.packaging.waiting === 0 && packagingProcessing === 0 && // Check packaging queue and processing set
+    stats.transport.waiting === 0 && transportProcessing === 0 // Check transport queue and processing set
+  );
+}
+
+async function runStabilityWorker(
+  queue: FileProcessingQueue,
+  config: ScanAndTransportConfig,
+  queueConfig: QueueConfig,
+  logFilePath: string,
+  onComplete: (file: FileItem, success: boolean, failureInfo?: FailureItem) => Promise<void>
+): Promise<void> {
+  await logToFile(logFilePath, "[Stability Worker] Started.");
+  const stabilityConfig = { ...DEFAULT_STABILITY_CONFIG, ...config.stability }; // Merge stability config
+
+  const processFile = async (file: FileItem, queueName: 'fileStability' | 'archiveStability') => {
+    const isArchive = queueName === 'archiveStability';
+    // Use merged stabilityConfig
+    const stabilityConf = isArchive ? stabilityConfig.archive : stabilityConfig.file;
+    const stabilityOptions = {
+      enabled: true,
+      maxRetries: stabilityConf?.maxRetries ?? DEFAULT_STABILITY_CONFIG.base!.maxRetries,
+      checkInterval: stabilityConf?.checkInterval ?? DEFAULT_STABILITY_CONFIG.base!.checkInterval,
+      largeFileThreshold: (stabilityConf as any)?.largeFileThreshold, // Use type assertion if needed
+      skipReadForLargeFiles: (stabilityConf as any)?.skipReadForLargeFiles ?? DEFAULT_STABILITY_CONFIG.file!.skipReadForLargeFiles
     };
-    
-    await logToFile(logFilePath, `开始扫描文件...`);
-    
-    // 8. 执行扫描
-    const scanResult = await scanFiles(scanOptions);
-    
-    await logToFile(logFilePath, `扫描完成，找到 ${scanResult.matchedFiles.length} 个匹配文件`);
-    await logToFile(logFilePath, `处理扫描队列...`);
-    
-    // 9. 处理匹配队列，将文件分配到合适的队列
-    queue.processMatchedQueue();
-    
-    // 10. 处理文件稳定性队列
-    await logToFile(logFilePath, `开始处理文件稳定性队列...`);
-    await processFileStabilityQueue();
-    await logToFile(logFilePath, `文件稳定性队列处理完成`);
-    
-    // 11. 处理压缩文件稳定性检测队列
-    await logToFile(logFilePath, `开始处理压缩文件稳定性队列...`);
-    await processArchiveStabilityQueue();
-    await logToFile(logFilePath, `压缩文件稳定性队列处理完成`);
-    
-    // 12. 处理MD5计算队列
-    await logToFile(logFilePath, `开始处理MD5计算队列...`);
-    await processMd5Queue();
-    await logToFile(logFilePath, `MD5计算队列处理初步完成`);
 
-    // 获取打包队列长度
-    const packagingQueueLength = queue.getFilesInQueue('packaging').length;
-    await logToFile(logFilePath, `准备处理打包队列，初始队列长度: ${packagingQueueLength}`);
-    
-    // 13. 处理打包队列
-    await processPackagingQueue();
-    await logToFile(logFilePath, `打包队列处理完成 (函数已返回)`);
-    
-    // 14. 处理传输队列
-    await logToFile(logFilePath, `开始处理传输队列...`);
-    await processTransportQueue();
-    await logToFile(logFilePath, `传输队列处理完成`);
-    
-    // 15. 处理重试队列中的文件
-    await logToFile(logFilePath, `开始处理重试队列...`);
-    await processRetryQueue();
-    await logToFile(logFilePath, `重试队列处理完成`);
-    
-    // 16. 收集最终结果
-    processedFiles.push(...queue.getCompletedFiles());
-    failedItems.push(...queue.getFailedFiles().map(file => {
-      return {
-        type: 'stability' as const,
-        path: file.path,
-        error: `文件处理失败`
-      } as FailureItem;
-    }));
-    
-    // 设置成功标志（如果有失败项，则为false）
-    result.success = failedItems.length === 0;
-    
-  } catch (error: any) {
-    // 处理顶层错误
-    const failureItem: FailureItem = {
-      type: 'scanError',
-      path: config.rootDir,
-      error: error.message || String(error)
-    };
-    failedItems.push(failureItem);
-    result.success = false;
-    
-    await logToFile(logFilePath, `错误: ${error.message || String(error)}`);
-    console.error('Error during scanAndTransport:', error);
-  } finally {
-    // 记录结束时间
-    const endTime = new Date();
-    const elapsedTimeMs = endTime.getTime() - startTime.getTime();
-    
-    // 更新结果对象
-    result.processedFiles = processedFiles;
-    result.failedItems = failedItems;
-    result.packagePaths = packagePaths;
-    result.transportSummary = transportResults;
-    result.endTime = endTime;
-    result.elapsedTimeMs = elapsedTimeMs;
-    
-    // 记录结束信息到日志
-    await logToFile(logFilePath, `--- ScanAndTransport End ---`);
-    await logToFile(logFilePath, `结束时间: ${endTime.toISOString()}`);
-    await logToFile(logFilePath, `耗时: ${elapsedTimeMs}ms`);
-    await logToFile(logFilePath, `成功: ${result.success}`);
-    await logToFile(logFilePath, `处理文件数: ${processedFiles.length}`);
-    await logToFile(logFilePath, `失败数: ${failedItems.length}`);
-    await logToFile(logFilePath, `包数量: ${packagePaths.length}`);
-    
     try {
-      // 保存结果到文件
-      await saveResultToFile(result.resultFilePath, result);
-      await logToFile(logFilePath, `结果已保存到: ${result.resultFilePath}`);
+      await logToFile(logFilePath, `[Stability Worker] 检测 ${isArchive ? '压缩' : ''}文件稳定性: ${file.path}`);
+      const isStable = await waitForFileStability(file.path, stabilityOptions);
 
-      // ---> 新增：上传结果文件 <--- 
-      if (config.transport.enabled) {
-        try {
-          await logToFile(logFilePath, `准备上传结果文件: ${result.resultFilePath}`);
-          const remoteResultDir = `${taskId}-${scanId}`;
-          const remoteResultPath = path.join(remoteResultDir, path.basename(result.resultFilePath));
-          
-          // 构建完整的 TransportOptions 用于结果文件上传
-          const resultTransportOptions: TransportOptions = {
-            enabled: true,
-            protocol: config.transport.protocol,
-            host: config.transport.host,
-            port: config.transport.port,
-            username: config.transport.username,
-            password: config.transport.password,
-            remotePath: config.transport.remotePath, // 使用基础远程路径
-            packageSize: 1, // 单文件
-            retryCount: DEFAULT_TRANSPORT_RETRY_COUNT,
-            timeout: DEFAULT_TRANSPORT_TIMEOUT,
-            debug: false
-          };
-          
-          // 上传结果文件
-          const resultTransportResult = await transferFile(
-            result.resultFilePath,
-            remoteResultPath,
-            resultTransportOptions
+      if (isStable) {
+        const stats = await fs.stat(file.path);
+        file.size = stats.size;
+        if (!file.metadata) file.metadata = {};
+        file.metadata.mtime = stats.mtime.toISOString();
+
+        if (isArchive) {
+          await logToFile(logFilePath, `[Stability Worker] 解压压缩文件: ${file.path}`);
+          const tempOutputDir = path.join(
+            os.tmpdir(),
+            `scan-archive-extract-${config.taskId || 'task'}-${path.basename(file.path, path.extname(file.path))}-${Date.now()}`
           );
+          try {
+            const archiveStabilityConf = stabilityConfig.archive; // Get archive specific config
+            const extractResult = await extractArchiveContents(file.path, tempOutputDir, {
+              preservePermissions: false,
+              // Pass merged config values correctly
+              skipLargeFiles: archiveStabilityConf?.skipLargeFiles,
+              largeFileThreshold: archiveStabilityConf?.largeFileThreshold
+            });
+            file.metadata.extractedPath = tempOutputDir;
+            file.metadata.extractedFiles = extractResult.extractedFiles;
+            if (extractResult.skippedLargeFiles && extractResult.skippedLargeFiles.length > 0) {
+                file.metadata.skippedLargeFiles = extractResult.skippedLargeFiles;
+            }
+             await logToFile(logFilePath, `[Stability Worker] 压缩文件稳定性检测和提取完成: ${file.path}`);
+             // 压缩文件稳定且解压成功 -> 进入 MD5 队列
+             queue.addToQueue('md5', file);
+             queue.getProcessingSet('archiveStability')?.delete(file.path); // Remove from processing *after* adding to next queue
 
-          if (resultTransportResult.success) {
-            await logToFile(logFilePath, `结果文件上传成功: ${resultTransportResult.remotePath}`);
-          } else {
-            await logToFile(logFilePath, `结果文件上传失败: ${resultTransportResult.error}`);
-            console.error(`结果文件上传失败: ${resultTransportResult.error}`);
+          } catch (extractError: any) {
+             await logToFile(logFilePath, `[Stability Worker] 压缩文件提取失败: ${file.path}, 错误: ${extractError.message}`);
+             // Use valid FailureType
+             const failureInfo: FailureItem = { type: 'extractArchive', path: file.path, error: `提取失败: ${extractError.message}` };
+             queue.getProcessingSet('archiveStability')?.delete(file.path);
+             await onComplete(file, false, failureInfo);
+             return; // 提取失败则结束此文件处理
           }
-        } catch (resultUploadError: any) {
-          const errorMsg = `上传结果文件时发生异常: ${resultUploadError.message}`;
-          await logToFile(logFilePath, errorMsg);
-          console.error(errorMsg);
+        } else {
+             await logToFile(logFilePath, `[Stability Worker] 文件稳定性检测完成: ${file.path}`);
+             // 普通文件稳定 -> 进入 MD5 队列
+             queue.addToQueue('md5', file);
+             queue.getProcessingSet('fileStability')?.delete(file.path);
         }
-      }
-      // ---> 结束新增 <--- 
 
+      } else {
+        await logToFile(logFilePath, `[Stability Worker] ${isArchive ? '压缩' : ''}文件稳定性检测失败 (超时/不稳定): ${file.path}`);
+        // Use valid FailureType
+        const failureInfo: FailureItem = { type: 'stability', path: file.path, error: '文件不稳定或检查超时' };
+        if (isArchive) queue.getProcessingSet('archiveStability')?.delete(file.path);
+        else queue.getProcessingSet('fileStability')?.delete(file.path);
+        await onComplete(file, false, failureInfo);
+      }
     } catch (error: any) {
-      await logToFile(logFilePath, `保存结果失败: ${error.message}`);
-      console.error('Error saving result file:', error);
+      await logToFile(logFilePath, `[Stability Worker] ${isArchive ? '压缩' : ''}文件稳定性检测过程发生异常: ${file.path}, 错误: ${error.message}`);
+      // Use valid FailureType
+      const failureInfo: FailureItem = { type: 'stability', path: file.path, error: `稳定性检查异常: ${error.message}` };
+      if (isArchive) queue.getProcessingSet('archiveStability')?.delete(file.path);
+      else queue.getProcessingSet('fileStability')?.delete(file.path);
+      await onComplete(file, false, failureInfo);
+    }
+  };
+
+  // Read concurrency from the merged queueConfig passed as argument
+  const fileConcurrency = queueConfig.maxConcurrentFileChecks;
+  const archiveConcurrency = queueConfig.maxConcurrentArchiveChecks;
+
+  while (!stopWorkers) {
+    let processedInLoop = 0;
+    let fileQueueEmpty = false;
+    let archiveQueueEmpty = false;
+
+    // 处理普通文件稳定性 (Use correct queue methods)
+    const fileQueue = queue.getFilesInQueue('fileStability');
+    const fileProcessingCount = queue.getProcessingSet('fileStability')?.size ?? 0;
+    if (fileQueue.length === 0) fileQueueEmpty = true;
+
+    if (fileQueue.length > 0 && fileProcessingCount < fileConcurrency!) {
+      const availableSlots = fileConcurrency! - fileProcessingCount;
+      const filesToProcess = fileQueue.slice(0, availableSlots);
+      filesToProcess.forEach(file => {
+          if (!queue.getProcessingSet('fileStability')?.has(file.path)) {
+              queue.getProcessingSet('fileStability')?.add(file.path);
+              processFile(file, 'fileStability').catch(e => { // Add catch for unhandled rejections
+                   logToFile(logFilePath, `[Stability Worker] Unhandled error processing file ${file.path}: ${e.message}`)
+                   queue.getProcessingSet('fileStability')?.delete(file.path);
+                   // Consider calling onComplete here as well
+              });
+              processedInLoop++;
+          }
+      });
     }
 
-    // ---> 上传日志文件 <--- 
-    if (config.transport.enabled) {
+    // 处理压缩文件稳定性 (Use correct queue methods)
+    const archiveQueue = queue.getFilesInQueue('archiveStability');
+    const archiveProcessingCount = queue.getProcessingSet('archiveStability')?.size ?? 0;
+    if (archiveQueue.length === 0) archiveQueueEmpty = true;
+
+    if (archiveQueue.length > 0 && archiveProcessingCount < archiveConcurrency!) {
+       const availableSlots = archiveConcurrency! - archiveProcessingCount;
+       const filesToProcess = archiveQueue.slice(0, availableSlots);
+       filesToProcess.forEach(file => {
+           if (!queue.getProcessingSet('archiveStability')?.has(file.path)) {
+              queue.getProcessingSet('archiveStability')?.add(file.path);
+              processFile(file, 'archiveStability').catch(e => { // Add catch
+                  logToFile(logFilePath, `[Stability Worker] Unhandled error processing archive ${file.path}: ${e.message}`)
+                  queue.getProcessingSet('archiveStability')?.delete(file.path);
+              });
+              processedInLoop++;
+           }
+       });
+    }
+
+    if (processedInLoop === 0) {
+        // Use queue's getDetailedQueueStats for idle check
+        const stats = queue.getDetailedQueueStats();
+        if (fileQueueEmpty && fileProcessingCount === 0 &&
+            archiveQueueEmpty && archiveProcessingCount === 0 &&
+            // Check if downstream queues are also idle or empty
+            (stats.md5.waiting === 0 && stats.md5.processing === 0) &&
+            (stats.packaging.waiting === 0) && // Packaging is serial, only check waiting
+            (stats.transport.waiting === 0 && stats.transport.processing === 0))
+        {
+            await logToFile(logFilePath, "[Stability Worker] Queues empty and upstream done/idle, waiting for global stop.");
+        }
+        await new Promise(resolve => setTimeout(resolve, 500)); // Wait longer if idle
+    } else {
+        await new Promise(resolve => setTimeout(resolve, 50)); // Shorter wait if active
+    }
+  }
+
+  await logToFile(logFilePath, "[Stability Worker] Stopped.");
+}
+
+async function runMd5Worker(
+  queue: FileProcessingQueue,
+  config: ScanAndTransportConfig,
+  queueConfig: QueueConfig,
+  logFilePath: string,
+  onComplete: (file: FileItem, success: boolean, failureInfo?: FailureItem) => Promise<void>
+): Promise<void> {
+  await logToFile(logFilePath, "[MD5 Worker] Started.");
+  const calculateMd5Enabled = config.calculateMd5 !== false; // Default true
+
+  const processFile = async (file: FileItem) => {
+    try {
+      let processedFile = file;
+      if (calculateMd5Enabled) {
+        await logToFile(logFilePath, `[MD5 Worker] 计算 MD5: ${file.path}`);
+        processedFile = await calculateFileMd5(file);
+        await logToFile(logFilePath, `[MD5 Worker] MD5 计算完成: ${file.path}, MD5: ${processedFile.metadata?.md5}`);
+      } else {
+        await logToFile(logFilePath, `[MD5 Worker] 跳过 MD5 计算 (已禁用): ${file.path}`);
+      }
+
+      // 成功 (计算完成或跳过) -> 进入 Packaging 队列
+      queue.addToQueue('packaging', processedFile);
+      // Let onComplete handle final state change
+
+    } catch (error: any) {
+      await logToFile(logFilePath, `[MD5 Worker] MD5 计算失败: ${file.path}, 错误: ${error.message}`);
+      // Use valid FailureType
+      const failureInfo: FailureItem = { type: 'md5', path: file.path, error: `MD5 计算失败: ${error.message}` };
+      await onComplete(file, false, failureInfo);
+      // onComplete should trigger removal via markAsFailed
+    } finally {
+        queue.getProcessingSet('md5')?.delete(file.path); // Remove from processing set
+    }
+  };
+
+  const concurrency = queueConfig.maxConcurrentMd5;
+
+  while (!stopWorkers) {
+    let processedInLoop = 0;
+    // Use correct queue methods
+    const md5Queue = queue.getFilesInQueue('md5');
+    const processingCount = queue.getProcessingSet('md5')?.size ?? 0;
+
+    if (md5Queue.length > 0 && processingCount < concurrency!) {
+      const availableSlots = concurrency! - processingCount;
+      const filesToProcess = md5Queue.slice(0, availableSlots);
+
+      filesToProcess.forEach(file => {
+        if (!queue.getProcessingSet('md5')?.has(file.path)) {
+            queue.getProcessingSet('md5')?.add(file.path);
+            processFile(file).catch(e => { // Add catch
+                logToFile(logFilePath, `[MD5 Worker] Unhandled error processing ${file.path}: ${e.message}`)
+                queue.getProcessingSet('md5')?.delete(file.path);
+            });
+            processedInLoop++;
+        }
+      });
+    }
+
+    // Use getDetailedQueueStats for idle check
+    const stats = queue.getDetailedQueueStats();
+    if (md5Queue.length === 0 && processingCount === 0 &&
+        // Check if upstream (stability) queues are empty/idle
+        (stats.fileStability.waiting === 0 && stats.fileStability.processing === 0) &&
+        (stats.archiveStability.waiting === 0 && stats.archiveStability.processing === 0) &&
+        // Check if downstream queues are also empty/idle
+        (stats.packaging.waiting === 0) &&
+        (stats.transport.waiting === 0 && stats.transport.processing === 0))
+    {
+        await logToFile(logFilePath, "[MD5 Worker] Queue empty and upstream done/idle, waiting for global stop.");
+    }
+    await new Promise(resolve => setTimeout(resolve, 500));
+  }
+
+  await logToFile(logFilePath, "[MD5 Worker] Stopped.");
+}
+
+async function runPackagingWorker(
+  queue: FileProcessingQueue,
+  config: ScanAndTransportConfig,
+  logFilePath: string,
+  packagePaths: string[],
+  onComplete: (file: FileItem, success: boolean, failureInfo?: FailureItem) => Promise<void>,
+  taskId: string,
+  scanId: string,
+  outputDir: string,
+  packageNamePattern: string
+): Promise<void> {
+  await logToFile(logFilePath, "[Packaging Worker] Started.");
+  // Remove queue.on call
+  // let stopWorker = false;
+  // queue.on('stop', () => { stopWorker = true; });
+  const workerId = '[Packaging Worker]';
+  let packageIndex = 0;
+  // Use DEFAULT_PACKAGING_TRIGGER correctly
+  const mergedPackagingTrigger = { ...DEFAULT_PACKAGING_TRIGGER, ...config.packagingTrigger };
+  const packageSizeThresholdBytes = (mergedPackagingTrigger.maxSizeMB ?? 0) * 1024 * 1024;
+  const packageFileThreshold = mergedPackagingTrigger.maxFiles ?? 0;
+  const packageCheckInterval = 1000; // Check every second
+
+  const pendingPackageFiles: FileItem[] = [];
+  let currentPackageSizeBytes = 0;
+  let lastActivityTime = Date.now();
+
+  try {
+      await fs.ensureDir(outputDir);
+  } catch (dirError: any) {
+      await logToFile(logFilePath, `${workerId} CRITICAL: Failed to create output directory ${outputDir}: ${dirError.message}. Worker stopping.`);
+      return; // Stop if cannot create output dir
+  }
+
+  const getPackagePath = (index: number): string => {
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      // Restore original naming
+      const name = packageNamePattern
+          .replace('{date}', timestamp)
+          .replace('{index}', String(index))
+          .replace('{taskId}', taskId)
+          .replace('{scanId}', scanId);
+      return path.join(outputDir, `${name}.zip`);
+  };
+
+  // Add suppressOnComplete parameter
+  const createAndProcessPackage = async (
+      filesToPackInput: FileItem[], // Rename input parameter
+      isFinalPackage: boolean = false,
+      suppressOnComplete: boolean = false
+  ): Promise<void> => {
+      // --- Deduplicate files based on path --- START
+      const uniqueFileMap = new Map<string, FileItem>();
+      for (const file of filesToPackInput) {
+          if (!uniqueFileMap.has(file.path)) {
+              uniqueFileMap.set(file.path, file);
+          }
+      }
+      const filesToPack = Array.from(uniqueFileMap.values()); // Use the deduplicated list
+      // --- Deduplicate files based on path --- END
+
+      if (filesToPack.length === 0) {
+          await logToFile(logFilePath, `${workerId} No unique files to pack after deduplication. Original input count: ${filesToPackInput.length}`);
+          // Handle completion for original files if needed (similar to previous attempt)
+          if (!suppressOnComplete) {
+              for (const originalFile of filesToPackInput) {
+                  // Consider marking as completed if they were just duplicates
+                  await onComplete(originalFile, true); 
+              }
+          }
+          return;
+      }
+  
+      const packagePath = getPackagePath(packageIndex++);
+      const totalSizeMB = filesToPack.reduce((sum, file) => sum + (file.size || 0), 0) / (1024 * 1024);
+      await logToFile(logFilePath, `${workerId} Creating ${isFinalPackage ? 'final ' : ''}package: ${path.basename(packagePath)}, Files: ${filesToPack.length} (Unique), Size: ${totalSizeMB.toFixed(2)}MB`);
+      const originalFilePaths = filesToPack.map(f => f.path); // Use unique list for metadata
+  
+      // Log the unique files being attempted to pack
+      const filePathsToPack = filesToPack.map(f => f.path);
+      await logToFile(logFilePath, `${workerId} Attempting to pack unique files: ${JSON.stringify(filePathsToPack)}`);
+  
       try {
-        await logToFile(logFilePath, `准备上传日志文件: ${logFilePath}`);
-        const remoteLogDir = `${taskId}-${scanId}`;
-        const remoteLogPath = path.join(remoteLogDir, path.basename(logFilePath));
-        
-        // 构建完整的 TransportOptions 用于日志上传
-        const logTransportOptions: TransportOptions = {
-          enabled: true, // 显式启用
+          // Use the unique list `filesToPack` here
+          const packResult = await createBatchPackage(filesToPack, packagePath, {
+              includeMd5: config.calculateMd5 !== false,
+              includeMetadata: true,
+              packageTags: [`task:${taskId}`, `scan:${scanId}`]
+          });
+  
+          if (packResult.success) {
+              packagePaths.push(packagePath);
+              await logToFile(logFilePath, `${workerId} Package created successfully: ${packagePath}`);
+  
+              const packageStats = await fs.stat(packagePath);
+              const packageFileItem: FileItem = {
+                  path: packagePath,
+                  name: path.basename(packagePath),
+                  size: packageStats.size,
+                  createTime: packageStats.birthtime,
+                  modifyTime: packageStats.mtime,
+                  origin: 'package',
+                  metadata: {
+                       packagedFiles: originalFilePaths,
+                       fileCount: filesToPack.length, // Use unique count
+                       originalSize: totalSizeMB * 1024 * 1024,
+                       taskId: taskId,
+                       scanId: scanId
+                  }
+              };
+              queue.addToQueue('transport', packageFileItem);
+              await logToFile(logFilePath, `${workerId} Package ${path.basename(packagePath)} added to transport queue.`);
+  
+             // Iterate over the UNIQUE list for completion
+             if (!suppressOnComplete) {
+                 for (const uniqueFile of filesToPack) {
+                      await onComplete(uniqueFile, true);
+                  }
+              } else {
+                  await logToFile(logFilePath, `${workerId} Suppressing onComplete for final package: ${path.basename(packagePath)}`);
+              }
+  
+          } else {
+              await logToFile(logFilePath, `${workerId} Failed to create package ${packagePath}: ${packResult.error}`);
+              // Iterate over the UNIQUE list for failure marking
+              for (const uniqueFile of filesToPack) {
+                  await onComplete(uniqueFile, false, {
+                      type: 'packaging',
+                      path: uniqueFile.path,
+                      error: `Failed to include in package ${packagePath}: ${packResult.error}`
+                  });
+              }
+          }
+      } catch (error: any) {
+          await logToFile(logFilePath, `${workerId} Error creating package ${packagePath}: ${error.message}`);
+          // Iterate over the UNIQUE list for failure marking
+          for (const uniqueFile of filesToPack) {
+              await onComplete(uniqueFile, false, {
+                  type: 'packaging',
+                  path: uniqueFile.path,
+                  error: `Exception during packaging for ${packagePath}: ${error.message}`
+              });
+          }
+      }
+  };
+
+  // Restore timer logic similar to original approach
+  let checkUpstreamInterval: NodeJS.Timeout | null = null;
+  // Define timer variable
+  let timer: NodeJS.Timeout | null = null;
+
+  const checkUpstreamAndFinalize = async () => {
+      if (checkUpstreamInterval) clearTimeout(checkUpstreamInterval);
+      checkUpstreamInterval = null;
+
+      if (stopWorkers) return;
+
+      // Restore upstream check logic using queue methods
+      const packagingQueue = queue.getFilesInQueue('packaging');
+      const md5Queue = queue.getFilesInQueue('md5');
+      const md5Processing = queue.getProcessingSet('md5')?.size ?? 0;
+      const isUpstreamIdle = md5Queue.length === 0 && md5Processing === 0;
+
+      if (isUpstreamIdle && packagingQueue.length === 0 && pendingPackageFiles.length > 0) {
+          const timeSinceLastActivity = Date.now() - lastActivityTime;
+          if (timeSinceLastActivity > 2000) { // Inactivity threshold
+              await logToFile(logFilePath, `${workerId} Upstream idle, queue empty, inactivity detected. Creating final package.`);
+              const filesToPack = [...pendingPackageFiles];
+              pendingPackageFiles.length = 0;
+              currentPackageSizeBytes = 0;
+              // Pass suppressOnComplete: true for the final package (Keep this)
+              await createAndProcessPackage(filesToPack, true, true);
+          } else {
+              if (!stopWorkers) checkUpstreamInterval = setTimeout(checkUpstreamAndFinalize, 500); // Check sooner
+          }
+      } else {
+         if (!stopWorkers) checkUpstreamInterval = setTimeout(checkUpstreamAndFinalize, packageCheckInterval); // Regular check
+      }
+  };
+  // Assign to timer variable
+  timer = setTimeout(checkUpstreamAndFinalize, packageCheckInterval);
+
+
+  // Restore main loop using correct queue methods and stopWorkers flag
+  while (!stopWorkers) {
+      const packagingQueue = queue.getFilesInQueue('packaging');
+      let file: FileItem | undefined = undefined;
+
+      if (packagingQueue.length > 0) {
+          file = packagingQueue.shift(); // Use shift to get and remove
+      }
+
+      if (file) {
+          lastActivityTime = Date.now();
+          pendingPackageFiles.push(file);
+          currentPackageSizeBytes += file.size || 0;
+
+          const shouldPackageBySize = packageSizeThresholdBytes > 0 && currentPackageSizeBytes >= packageSizeThresholdBytes;
+          const shouldPackageByCount = packageFileThreshold > 0 && pendingPackageFiles.length >= packageFileThreshold;
+
+          if (shouldPackageByCount || shouldPackageBySize) {
+              await logToFile(logFilePath, `${workerId} Trigger met during file add (Files: ${shouldPackageByCount}, Size: ${shouldPackageBySize}). Creating package.`);
+              const filesToPack = [...pendingPackageFiles];
+              pendingPackageFiles.length = 0; // Clear pending
+              currentPackageSizeBytes = 0;
+              await createAndProcessPackage(filesToPack, false); // Regular package
+              await new Promise(resolve => setImmediate(resolve)); // Yield
+          }
+      } else {
+          // If queue empty, wait before next check
+          await new Promise(resolve => setTimeout(resolve, 100));
+      }
+  }
+
+  // --- Restore Cleanup --- (Keep suppressOnComplete logic)
+  // Clear the correct timer
+  if (timer) clearInterval(timer);
+  await logToFile(logFilePath, `${workerId} Stop signal received. Starting cleanup.`);
+
+  // Final package for any remaining files
+  const remainingFiles = [...pendingPackageFiles];
+  if (remainingFiles.length > 0) {
+      await logToFile(logFilePath, `${workerId} Creating final package during cleanup for ${remainingFiles.length} files.`);
+      // Pass suppressOnComplete: true for the final package
+      await createAndProcessPackage(remainingFiles, true, true);
+  }
+
+  await logToFile(logFilePath, `${workerId} Stopped.`);
+}
+
+async function runTransportWorker(
+  queue: FileProcessingQueue,
+  config: ScanAndTransportConfig,
+  queueConfig: QueueConfig,
+  logFilePath: string,
+  transportResults: { success: boolean; filePath: string; remotePath: string; error?: string }[],
+  taskId: string,
+  scanId: string
+): Promise<void> {
+  await logToFile(logFilePath, "[Transport Worker] Started.");
+
+  if (!config.transport.enabled) {
+    await logToFile(logFilePath, "[Transport Worker] Transport disabled, worker will idle.");
+    // No loop needed if disabled
+    while(!stopWorkers) {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+    await logToFile(logFilePath, "[Transport Worker] Stopped (was disabled).");
+    return;
+  }
+
+  const processFile = async (packageFile: FileItem) => {
+    try {
+      await logToFile(logFilePath, `[Transport Worker] 开始传输文件: ${packageFile.path}`);
+      const remoteBasePath = config.transport.remotePath || '/';
+      // Construct relative path for transport function
+      const relativeRemotePath = path.posix.join(`${taskId}-${scanId}`, path.basename(packageFile.path));
+      const expectedRemoteFullPath = path.posix.join(remoteBasePath, relativeRemotePath);
+
+      // Build transport options EXPLICITLY using merged/default values
+      const transportOptions: TransportOptions = {
+          enabled: true,
           protocol: config.transport.protocol,
           host: config.transport.host,
           port: config.transport.port,
           username: config.transport.username,
           password: config.transport.password,
-          remotePath: config.transport.remotePath, // 使用配置的基础远程路径
-          packageSize: 1, // 对于单个文件不重要，设为1
-          retryCount: DEFAULT_TRANSPORT_RETRY_COUNT, // 使用默认值
-          timeout: DEFAULT_TRANSPORT_TIMEOUT, // 使用默认值
-          debug: false // 设置默认值
-        };
-        
-        // 使用构造好的选项上传日志文件
-        const logTransportResult = await transferFile(
-          logFilePath,
-          remoteLogPath,
-          logTransportOptions
-        );
-
-        if (logTransportResult.success) {
-          await logToFile(logFilePath, `日志文件上传成功: ${logTransportResult.remotePath}`);
-        } else {
-          await logToFile(logFilePath, `日志文件上传失败: ${logTransportResult.error}`);
-          // 可以选择将此失败添加到 failedItems，但这发生在 finally 块中，可能不会反映在最终结果对象中
-          console.error(`日志文件上传失败: ${logTransportResult.error}`);
-        }
-      } catch (logUploadError: any) {
-        const errorMsg = `上传日志文件时发生异常: ${logUploadError.message}`;
-        await logToFile(logFilePath, errorMsg);
-        console.error(errorMsg);
-      }
-    }
-    // ---> 结束上传日志文件 <--- 
-
-  }
-  
-  return result;
-  
-  // --- 辅助函数 ---
-  
-  /**
-   * 处理文件稳定性检测队列
-   */
-  async function processFileStabilityQueue(): Promise<void> {
-    return new Promise(resolve => {
-      const processor = async (files: FileItem[]) => {
-        await logToFile(logFilePath, `处理文件稳定性检测: ${files.length} 个文件`);
-        
-        // 实现文件稳定性检测逻辑
-        for (const file of files) {
-          try {
-            await logToFile(logFilePath, `检测文件稳定性: ${file.path}`);
-            
-            // 使用core/stability.ts中的稳定性检测函数
-            const stabilityOptions = {
-              enabled: true,
-              maxRetries: stabilityConfig?.file?.maxRetries || 3,
-              retryInterval: stabilityConfig?.file?.checkInterval || 500,
-              checkInterval: stabilityConfig?.file?.checkInterval || 500,
-              largeFileThreshold: stabilityConfig?.file?.largeFileThreshold || 100 * 1024 * 1024,
-              skipReadForLargeFiles: stabilityConfig?.file?.skipReadForLargeFiles || true
-            };
-            
-            // 等待文件稳定
-            const isStable = await waitForFileStability(file.path, stabilityOptions);
-            
-            if (isStable) {
-              // 文件稳定，获取文件的最新信息
-              const stats = await fs.stat(file.path);
-              
-              // 更新文件信息
-              file.size = stats.size;
-              if (!file.metadata) file.metadata = {};
-              file.metadata.mtime = stats.mtime.toISOString();
-              
-              // 将文件标记为已完成处理并添加到MD5队列
-              queue.markAsCompleted(file.path);
-              queue.addToQueue('md5', file);
-              processedFiles.push(file);
-              await logToFile(logFilePath, `文件稳定性检测完成: ${file.path} (大小: ${stats.size} 字节)`);
-            } else {
-              // 文件不稳定，加入重试队列
-              queue.addToRetryQueue(file, 'fileStability');
-              await logToFile(logFilePath, `文件稳定性检测失败，加入重试队列: ${file.path}`);
-            }
-          } catch (error: any) {
-            // 处理文件稳定性检测失败
-            await logToFile(logFilePath, `文件稳定性检测失败: ${file.path}, 错误: ${error.message}`);
-            failedItems.push({
-              type: 'stability' as const,
-              path: file.path,
-              error: `文件稳定性检测失败: ${error.message}`
-            });
-            queue.markAsFailed(file.path);
-          }
-        }
-        
-        // ---> 新增：标记处理完成 <--- 
-        files.forEach(file => {
-          queue.getProcessingSet('fileStability')?.delete(file.path);
-        });
-        // ---> 结束新增 <--- 
-        
-        // 检查是否还有文件需要处理
-        if (queue.getFilesInQueue('fileStability').length > 0 || 
-            queue.getDetailedQueueStats().fileStability.processing > 0) {
-          // 继续处理下一批
-          queue.processNextBatch('fileStability', queueConfig.maxConcurrentFileChecks || 5, processor);
-        } else {
-          resolve();
-        }
+          remotePath: remoteBasePath, // Base path for connection
+          // Use defaults for retry/timeout if not provided in config
+          retryCount: DEFAULT_TRANSPORT_RETRY_COUNT,
+          timeout: DEFAULT_TRANSPORT_TIMEOUT,
+          debug: false,
+          packageSize: 1,
       };
-      
-      // 开始处理第一批
-      queue.processNextBatch('fileStability', queueConfig.maxConcurrentFileChecks || 5, processor);
-    });
-  }
-  
-  /**
-   * 处理压缩文件稳定性检测队列
-   */
-  async function processArchiveStabilityQueue(): Promise<void> {
-    return new Promise(resolve => {
-      const processor = async (files: FileItem[]) => {
-        await logToFile(logFilePath, `处理压缩文件稳定性检测: ${files.length} 个文件`);
-        
-        for (const file of files) {
-          try {
-            await logToFile(logFilePath, `检测压缩文件稳定性: ${file.path}`);
-            
-            // 使用core/stability.ts中的稳定性检测函数
-            const stabilityOptions = {
-              enabled: true,
-              maxRetries: stabilityConfig?.archive?.maxRetries || 3,
-              retryInterval: stabilityConfig?.archive?.checkInterval || 500,
-              checkInterval: stabilityConfig?.archive?.checkInterval || 500,
-              largeFileThreshold: stabilityConfig?.archive?.largeFileThreshold || 100 * 1024 * 1024,
-              skipReadForLargeFiles: stabilityConfig?.archive?.skipReadForLargeFiles || true
-            };
-            
-            // 等待文件稳定
-            const isStable = await waitForFileStability(file.path, stabilityOptions);
-            
-            if (isStable) {
-              // 压缩文件稳定，获取文件的最新信息
-              const stats = await fs.stat(file.path);
-              
-              // 更新文件信息
-              file.size = stats.size;
-              if (!file.metadata) file.metadata = {};
-              file.metadata.mtime = stats.mtime.toISOString();
-              
-              // 检测压缩文件完整性并解压
-              await logToFile(logFilePath, `解压压缩文件: ${file.path}`);
-              
-              // 为解压创建临时目录
-              const tempOutputDir = path.join(
-                os.tmpdir(),
-                `scan-archive-extract-${taskId || Date.now()}`,
-                path.basename(file.path, path.extname(file.path))
-              );
-              
-              try {
-                // 使用core/archive.ts中的函数提取压缩文件内容
-                const extractResult = await extractArchiveContents(file.path, tempOutputDir, {
-                  preservePermissions: false,
-                  skipLargeFiles: stabilityConfig?.archive?.skipLargeFiles,
-                  largeFileThreshold: stabilityConfig?.archive?.largeFileThreshold
-                });
-                
-                // 更新文件元数据，添加提取的内容信息
-                if (!file.metadata) file.metadata = {};
-                file.metadata.extractedPath = tempOutputDir;
-                file.metadata.extractedFiles = extractResult.extractedFiles;
-                if (extractResult.skippedLargeFiles && extractResult.skippedLargeFiles.length > 0) {
-                  file.metadata.skippedLargeFiles = extractResult.skippedLargeFiles;
-                }
-                
-                // 将文件标记为已完成处理并添加到MD5队列
-                queue.markAsCompleted(file.path);
-                queue.addToQueue('md5', file);
-                processedFiles.push(file);
-                await logToFile(logFilePath, `压缩文件稳定性检测和提取完成: ${file.path} (大小: ${stats.size} 字节)`);
-              } catch (error: any) {
-                await logToFile(logFilePath, `压缩文件提取失败: ${file.path}, 错误: ${error.message}`);
-                throw new Error(`压缩文件提取失败: ${error.message}`);
-              }
-            } else {
-              // 文件不稳定，加入重试队列
-              queue.addToRetryQueue(file, 'archiveStability');
-              await logToFile(logFilePath, `压缩文件稳定性检测失败，加入重试队列: ${file.path}`);
-            }
-          } catch (error: any) {
-            // 处理压缩文件稳定性检测失败
-            await logToFile(logFilePath, `压缩文件稳定性检测失败: ${file.path}, 错误: ${error.message}`);
-            failedItems.push({
-              type: 'stability' as const,
-              path: file.path,
-              error: `压缩文件稳定性检测失败: ${error.message}`
-            });
-            queue.markAsFailed(file.path);
-          }
-        }
-        
-        // ---> 新增：标记处理完成 <--- 
-        files.forEach(file => {
-          queue.getProcessingSet('archiveStability')?.delete(file.path);
-        });
-        // ---> 结束新增 <--- 
-        
-        // 检查是否还有文件需要处理
-        if (queue.getFilesInQueue('archiveStability').length > 0 || 
-            queue.getDetailedQueueStats().archiveStability.processing > 0) {
-          // 继续处理下一批
-          queue.processNextBatch('archiveStability', queueConfig.maxConcurrentArchiveChecks || 2, processor);
-        } else {
-          resolve();
-        }
-      };
-      
-      // 开始处理第一批
-      queue.processNextBatch('archiveStability', queueConfig.maxConcurrentArchiveChecks || 2, processor);
-    });
-  }
-  
-  /**
-   * 处理MD5计算队列
-   */
-  async function processMd5Queue(): Promise<void> {
-    // 添加调试日志
-    const md5Files = queue.getFilesInQueue('md5');
-    await logToFile(logFilePath, `MD5队列中文件数量: ${md5Files.length}`);
-    if (md5Files.length > 0) {
-      await logToFile(logFilePath, `MD5队列文件列表: ${md5Files.map(f => f.path).join(', ')}`);
-    }
 
-    if (!calculateMd5) {
-      // 如果不需要计算MD5，则将文件直接添加到打包队列
-      queue.getFilesInQueue('md5').forEach(file => {
-        queue.addToQueue('packaging', file);
+      // Perform the transfer using relative path
+      const result = await transferFile(
+        packageFile.path,
+        relativeRemotePath, // Relative path for the specific file
+        transportOptions
+      );
+
+      // Record the result
+      transportResults.push({
+          success: result.success,
+          filePath: result.filePath,
+          remotePath: result.remotePath || expectedRemoteFullPath, // Use result path, fallback to constructed
+          error: result.error
       });
-      await logToFile(logFilePath, `MD5计算被禁用，直接添加到打包队列`);
-      return Promise.resolve();
-    }
-    
-    return new Promise<void>((resolve) => {
-      try {
-        const processor = async (files: FileItem[]) => {
-          await logToFile(logFilePath, `计算MD5: ${files.length} 个文件`);
-          
-          // 单独处理每个文件
-          for (const file of files) {
-            try {
-              // 计算MD5
-              const updatedFile = await calculateFileMd5(file);
-              
-              // 将文件添加到打包队列
-              queue.addToQueue('packaging', updatedFile);
-              
-              // 添加到处理过的文件列表
-              processedFiles.push(updatedFile);
-              
-              await logToFile(logFilePath, `MD5计算完成: ${file.path}`);
-            } catch (fileError: any) {
-              // 处理单个文件MD5计算失败
-              await logToFile(logFilePath, `MD5计算失败: ${file.path}, 错误: ${fileError.message}`);
-              failedItems.push({
-                type: 'md5',
-                path: file.path,
-                error: `MD5计算失败: ${fileError.message}`
-              });
-              queue.markAsFailed(file.path);
-            }
-          }
 
-          // ---> 新增：标记处理完成 <--- 
-          files.forEach(file => {
-            queue.getProcessingSet('md5')?.delete(file.path);
-          });
-          // ---> 结束新增 <--- 
-          
-          // 检查是否还有文件需要处理
-          if (queue.getFilesInQueue('md5').length > 0 || 
-              queue.getDetailedQueueStats().md5.processing > 0) {
-            // 继续处理下一批
-            queue.processNextBatch('md5', queueConfig.maxConcurrentMd5 || 5, processor);
-          } else {
-            // 调试信息
-            const packagingFiles = queue.getFilesInQueue('packaging');
-            const message1 = `MD5处理完毕，打包队列中文件数量: ${packagingFiles.length}`;
-            logToFile(logFilePath, message1)
-              .then(() => {
-                if (packagingFiles.length > 0) {
-                  const message2 = `MD5处理完毕，打包队列文件列表: ${packagingFiles.map(f => f.path).join(', ')}`;
-                  return logToFile(logFilePath, message2);
-                }
-                return Promise.resolve();
-              })
-              .then(() => resolve())
-              .catch(() => resolve()); // 即使日志记录失败也继续执行
-          }
-        };
-        
-        // 开始处理第一批
-        queue.processNextBatch('md5', queueConfig.maxConcurrentMd5 || 5, processor);
-      } catch (error: any) {
-        // 安全记录错误
-        const errorMessage = `MD5队列处理时发生错误: ${error.message}`;
-        logToFile(logFilePath, errorMessage)
-          .then(() => {
-            if (error.stack) {
-              return logToFile(logFilePath, `错误堆栈: ${error.stack}`);
-            }
-            return Promise.resolve();
-          })
-          .then(() => resolve())
-          .catch(() => resolve()); // 即使日志记录失败也继续执行
-      }
-    });
-  }
-  
-  /**
-   * 处理打包队列
-   */
-  async function processPackagingQueue(): Promise<void> {
-    await logToFile(logFilePath, `启动打包队列处理逻辑`);
-
-    // 状态变量：在 processor 调用之间保持
-    let currentPackageFiles: FileItem[] = [];
-    let currentPackageSize = 0;
-    let packageIndex = 0;
-
-    // 确保输出目录存在 (移到内部，确保执行)
-    try {
-      await fs.ensureDir(outputDir);
-    } catch (dirError: any) {
-      await logToFile(logFilePath, `创建输出目录 ${outputDir} 失败: ${dirError.message}`);
-      // 如果目录创建失败，后续打包会失败，错误会在 createAndAddPackage 中处理
-    }
-
-    // 辅助函数：生成包路径 (保持不变)
-    const packagePathPrefix = (index: number): string => {
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const packageName = packageNamePattern
-        .replace('{date}', timestamp)
-        .replace('{index}', String(index))
-        .replace('{taskId}', taskId);
-      return path.join(outputDir, `${packageName}.zip`);
-    };
-
-    // 辅助函数：创建并添加包 (保持不变，但错误处理更细致)
-    const createAndAddPackage = async (packageFiles: FileItem[], targetPath: string): Promise<void> => {
-        const packageSize = packageFiles.reduce((sum, f) => sum + (f.size || 0), 0);
-        await logToFile(logFilePath, `创建打包: ${targetPath}, 包含 ${packageFiles.length} 个文件, 总大小: ${(packageSize / (1024 * 1024)).toFixed(2)}MB`);
-        try {
-          const packResult = await createBatchPackage(packageFiles, targetPath, {
-            includeMd5: true,
-            includeMetadata: true,
-            onProgress: async (progress) => {
-               await logToFile(logFilePath, `打包进度: ${targetPath}, 已处理 ${progress.processedFiles}/${progress.totalFiles} 文件 (${progress.percentage}%)`);
-               if (progress.currentFile) {
-                 await logToFile(logFilePath, `当前处理文件: ${progress.currentFile}, 进度: ${progress.currentFileProgress}%`);
-               }
-            },
-            packageTags: [`task:${taskId}`, `scan:${scanId}`]
-          });
-
-          if (packResult.success) {
-            packagePaths.push(targetPath);
-            for (const packagedFile of packageFiles) {
-              if (!packagedFile.metadata) packagedFile.metadata = {};
-              packagedFile.metadata.packagePath = targetPath;
-              // 注意：文件打包成功不代表整个流程完成，不在此处调用 markAsCompleted
-            }
-            // 创建代表包的 FileItem 并加入传输队列
-            const packageStat = await fs.stat(targetPath);
-            queue.addToQueue('transport', {
-              path: targetPath,
-              name: path.basename(targetPath),
-              createTime: new Date(),
-              modifyTime: new Date(),
-              size: packageStat.size,
-              origin: 'filesystem',
-              metadata: {
-                packagedFiles: packageFiles.map(f => f.path),
-                fileCount: packageFiles.length,
-                originalSize: packageSize
-              }
-            });
-            await logToFile(logFilePath, `打包成功，包已加入传输队列: ${targetPath}`);
-          } else {
-            const errMsg = `打包失败: ${packResult.error?.message || '未知错误'}`;
-            await logToFile(logFilePath, errMsg);
-            for (const packagedFile of packageFiles) {
-              if (!failedItems.some(fi => fi.path === packagedFile.path)) { // 避免重复记录失败
-                 failedItems.push({ type: 'packaging', path: packagedFile.path, error: errMsg });
-                 queue.markAsFailed(packagedFile.path); // 标记原始文件为失败
-              }
-            }
-            // 抛出错误以便上层知道创建包失败
-            throw new Error(errMsg);
-          }
-        } catch (error: any) {
-           const errMsg = `打包过程发生异常: ${error.message}`;
-           await logToFile(logFilePath, errMsg);
-           for (const packagedFile of packageFiles) {
-             if (!failedItems.some(fi => fi.path === packagedFile.path)) {
-                failedItems.push({ type: 'packaging', path: packagedFile.path, error: errMsg });
-                queue.markAsFailed(packagedFile.path);
-             }
-           }
-           // 抛出错误
-           throw new Error(errMsg);
-        }
-    };
-
-    // --- 主处理逻辑 --- 
-    return new Promise<void>((resolve) => {
-      let checkInProgress = false; // 防止并发检查
-
-      // 检查是否所有处理都完成，可以创建最终包并结束
-      const checkCompletion = async () => {
-        if (checkInProgress) {
-          await logToFile(logFilePath, `完成状态检查已在进行中，跳过`);
-          return;
-        }
-        checkInProgress = true;
-        await logToFile(logFilePath, `开始检查打包完成状态...`);
-
-        const stats = queue.getDetailedQueueStats();
-        const packagingWaiting = queue.getFilesInQueue('packaging').length;
-        const packagingProcessing = stats.packaging.processing;
-
-        // 关键条件：上游队列完成 + 打包队列完成
-        const upstreamDone = 
-          stats.fileStability.waiting === 0 && stats.fileStability.processing === 0 &&
-          stats.archiveStability.waiting === 0 && stats.archiveStability.processing === 0 &&
-          stats.md5.waiting === 0 && stats.md5.processing === 0;
-          
-        const packagingDone = packagingWaiting === 0 && packagingProcessing === 0;
-
-        await logToFile(logFilePath, `完成状态: 上游=${upstreamDone}, 打包=${packagingDone} (等待:${packagingWaiting}, 处理中:${packagingProcessing}), 剩余当前包=${currentPackageFiles.length}`);
-
-        if (upstreamDone && packagingDone) {
-          // 所有条件满足，处理最后一个包
-          if (currentPackageFiles.length > 0) {
-            await logToFile(logFilePath, `所有处理完成，创建最后一个包含 ${currentPackageFiles.length} 个文件的包`);
-            const filesToPack = [...currentPackageFiles]; // 捕获当前状态
-            const finalPackagePath = packagePathPrefix(packageIndex++);
-            currentPackageFiles = []; // 重置状态
-            currentPackageSize = 0;
-            try {
-                await createAndAddPackage(filesToPack, finalPackagePath);
-            } catch(e: any) {
-                 await logToFile(logFilePath, `创建最后一个包时出错: ${e.message}`);
-                 // 错误已在 createAndAddPackage 中记录和标记
-            }
-          } else {
-             await logToFile(logFilePath, `所有处理完成，没有剩余文件需要打包`);
-          }
-          await logToFile(logFilePath, `解析打包队列 Promise (完成)`);
-          checkInProgress = false;
-          resolve(); // **** 解析 Promise ****
-        } else {
-          // 打包或上游未完成，调度延迟检查
-          logToFile(logFilePath, `[PackageQueue] Packaging or upstream tasks not complete, scheduling delayed check for ${currentPackageFiles.length} items after 1000ms.`);
-          setTimeout(
-            () => processPackagingQueue(),
-            1000
-          );
-        }
-      };
-
-      // 处理从队列中取出的一批文件
-      const processor = async (files: FileItem[]) => {
-        await logToFile(logFilePath, `处理打包批次: ${files.length} 个文件`);
-
-        for (const file of files) {
-          currentPackageFiles.push(file);
-          currentPackageSize += file.size || 0;
-          await logToFile(logFilePath, `文件 ${file.name} 加入当前包 (现有 ${currentPackageFiles.length} 文件, ${currentPackageSize} B)`);
-
-          const fileTrigger = currentPackageFiles.length >= packagingTrigger.maxFiles;
-          const sizeTrigger = currentPackageSize >= packagingTrigger.maxSizeMB * 1024 * 1024;
-
-          if (fileTrigger || sizeTrigger) {
-             await logToFile(logFilePath, `打包触发器满足 (文件: ${fileTrigger}, 大小: ${sizeTrigger}), 创建包`);
-            const filesToPack = [...currentPackageFiles]; // 捕获状态
-            const packagePath = packagePathPrefix(packageIndex++);
-            // 重置共享状态 *之前* await
-            currentPackageFiles = [];
-            currentPackageSize = 0;
-            try {
-              await createAndAddPackage(filesToPack, packagePath);
-            } catch (e: any) {
-                logToFile(logFilePath, `创建包 ${packagePath} 时捕获错误: ${e.message}`);
-                // 错误已在 createAndAddPackage 中处理，此处仅记录
-            }
-          } else {
-              logToFile(logFilePath, `文件 ${file.name} 加入后未触发打包`);
-          }
-        } // 结束 for 循环
-
-        // 标记本批次文件处理完成 (从 processing 集合中移除)
-        files.forEach(file => {
-          queue.getProcessingSet('packaging')?.delete(file.path);
-        });
-        await logToFile(logFilePath, `批次 ${files.map(f=>f.name).join(',')} 标记为打包处理完成`);
-
-        // 处理完一批后，检查是否需要处理下一批，或者是否应该检查完成状态
-        const packagingWaiting = queue.getFilesInQueue('packaging').length;
-        const packagingProcessing = queue.getDetailedQueueStats().packaging.processing; // 检查其他processor是否还在运行
-
-        if (packagingWaiting > 0 || packagingProcessing > 0) {
-            logToFile(logFilePath, `打包队列仍有 ${packagingWaiting} 等待 / ${packagingProcessing} 处理中，调度下一批次`);
-            // 如果还有文件在等待队列或正在被其他 processor 处理，继续调度
-            // 使用较小的批次大小以允许更频繁地检查触发器
-            queue.processNextBatch('packaging', packagingTrigger.maxFiles || 10, processor);
-        } else {
-             logToFile(logFilePath, `打包队列已空或无处理中，开始检查最终完成状态`);
-            // 如果没有文件在等待，并且没有其他 processor 在运行，开始检查是否可以完成
-            checkCompletion();
-        }
-      }; // 结束 processor 函数
-
-      // 初始触发器：开始处理第一批
-      const initialBatchSize = packagingTrigger.maxFiles > 0 ? packagingTrigger.maxFiles : 10; // 初始批次大小
-      logToFile(logFilePath, `首次触发打包处理器，批次大小: ${initialBatchSize}`);
-      queue.processNextBatch('packaging', initialBatchSize, processor);
-
-      // 处理初始队列为空的情况：仍然需要启动检查完成状态的循环
-      const initialFiles = queue.getFilesInQueue('packaging');
-      const initialProcessing = queue.getDetailedQueueStats().packaging.processing;
-      if(initialFiles.length === 0 && initialProcessing === 0) {
-          logToFile(logFilePath, `打包队列初始为空且无处理中，直接启动完成状态检查`);
-          checkCompletion();
-      }
-
-    }); // 结束 Promise
-  }
-  
-  /**
-   * 处理传输队列
-   */
-  async function processTransportQueue(): Promise<void> {
-    // 如果不需要传输，则标记所有文件为已完成
-    if (!config.transport.enabled) {
-      queue.getFilesInQueue('transport').forEach(file => {
-        queue.markAsCompleted(file.path);
-      });
-      await logToFile(logFilePath, `传输功能已禁用，跳过传输`);
-      return Promise.resolve();
-    }
-    
-    // 构建子目录名称
-    const remoteSubDir = `${taskId}-${scanId}`;
-    await logToFile(logFilePath, `将文件上传到远程目录: ${remoteSubDir}`);
-    
-    return new Promise(resolve => {
-      const processor = async (files: FileItem[]) => {
-        await logToFile(logFilePath, `处理传输: ${files.length} 个包文件`);
-        
-        for (const file of files) {
-          try {
-            await logToFile(logFilePath, `开始传输文件: ${file.path}`);
-            
-            // 构建远程文件路径（放在任务id-扫描id子目录下）
-            const remotePath = path.join(remoteSubDir, path.basename(file.path));
-            
-            // 使用transferFile函数进行文件传输
-            const transportResult = await transferFile(
-              file.path,
-              remotePath,
-              {
-                ...config.transport,
-                packageSize: packagingTrigger.maxFiles,
-                retryCount: DEFAULT_TRANSPORT_RETRY_COUNT,
-                timeout: DEFAULT_TRANSPORT_TIMEOUT
-              }
-            );
-            
-            // 添加传输结果
-            transportResults.push({
-              success: transportResult.success,
-              filePath: transportResult.filePath,
-              remotePath: transportResult.remotePath,
-              error: transportResult.error
-            });
-            
-            // 根据传输结果处理文件状态
-            if (transportResult.success) {
-              // 标记文件为已完成
-              queue.markAsCompleted(file.path);
-              
-              await logToFile(logFilePath, `传输成功: ${file.path} -> ${transportResult.remotePath}`);
-            } else {
-              // 处理传输失败
-              await logToFile(logFilePath, `传输失败: ${file.path}, 错误: ${transportResult.error}`);
-              failedItems.push({
-                type: 'transport',
-                path: file.path,
-                error: `传输失败: ${transportResult.error}`
-              });
-              
-              // 检查是否应该重试
-              if (DEFAULT_TRANSPORT_RETRY_COUNT > 0) {
-                queue.addToRetryQueue(file, 'transport');
-                await logToFile(logFilePath, `将文件添加到传输重试队列: ${file.path}`);
-              } else {
-                queue.markAsFailed(file.path);
-              }
-            }
-          } catch (error: any) {
-            // 处理调用transferFile函数时可能发生的异常
-            const errorMessage = error.message || '未知错误';
-            
-            // 记录失败结果
-            transportResults.push({
-              success: false,
-              filePath: file.path,
-              remotePath: path.join(config.transport.remotePath || '/upload', remoteSubDir, path.basename(file.path)),
-              error: errorMessage
-            });
-            
-            await logToFile(logFilePath, `传输过程发生异常: ${file.path}, 错误: ${errorMessage}`);
-            failedItems.push({
-              type: 'transport',
-              path: file.path,
-              error: `传输异常: ${errorMessage}`
-            });
-            
-            queue.markAsFailed(file.path);
-          }
-        }
-        
-        // ---> 新增：标记处理完成 <--- 
-        files.forEach(file => {
-          queue.getProcessingSet('transport')?.delete(file.path);
-        });
-        // ---> 结束新增 <--- 
-        
-        // 检查是否还有文件需要处理
-        if (queue.getFilesInQueue('transport').length > 0 || 
-            queue.getDetailedQueueStats().transport.processing > 0) {
-          // 继续处理下一批
-          queue.processNextBatch('transport', queueConfig.maxConcurrentTransfers || 2, processor);
-        } else {
-          resolve();
-        }
-      };
-      
-      // 开始处理第一批
-      queue.processNextBatch('transport', queueConfig.maxConcurrentTransfers || 2, processor);
-    });
-  }
-  
-  /**
-   * 处理重试队列
-   */
-  async function processRetryQueue(): Promise<void> {
-    return new Promise(resolve => {
-      const processor = (files: FileItem[], targetQueue: string) => {
-        // 将文件添加回原来的队列
-        files.forEach(file => {
-          queue.addToQueue(targetQueue as any, file);
-        });
-      };
-      
-      // 处理重试队列
-      queue.processRetryQueue(processor);
-      
-      // 检查是否需要继续处理
-      if (queue.getQueueStats().retrying > 0) {
-        // 等待一段时间后再次处理
-        setTimeout(() => {
-          processRetryQueue().then(resolve);
-        }, queueConfig.stabilityRetryDelay || 2000);
+      if (result.success) {
+          await logToFile(logFilePath, `[Transport Worker] 传输成功: ${packageFile.path} -> ${result.remotePath}`);
+          // Signal completion for the *package file* (not the originals)
+          queue.markAsCompleted(packageFile.path);
       } else {
-        resolve();
+          await logToFile(logFilePath, `[Transport Worker] 传输失败: ${packageFile.path}, 错误: ${result.error}`);
+          // Use valid FailureType for the *package file*
+          const failureInfo: FailureItem = { type: 'transport', path: packageFile.path, error: `传输失败: ${result.error}` };
+          queue.markAsFailed(packageFile.path, failureInfo); // Mark package failed
       }
-    });
+
+    } catch (error: any) {
+        const errorMessage = error.message || '未知传输错误';
+        await logToFile(logFilePath, `[Transport Worker] 传输过程发生异常: ${packageFile.path}, 错误: ${errorMessage}`);
+        transportResults.push({
+            success: false,
+            filePath: packageFile.path,
+            remotePath: path.posix.join(config.transport.remotePath || '/', `${taskId}-${scanId}`, path.basename(packageFile.path)),
+            error: `传输异常: ${errorMessage}`
+        });
+        // Use valid FailureType for the *package file*
+        const failureInfo: FailureItem = { type: 'transport', path: packageFile.path, error: `传输异常: ${errorMessage}` };
+        queue.markAsFailed(packageFile.path, failureInfo);
+    } finally {
+        queue.getProcessingSet('transport')?.delete(packageFile.path);
+    }
+  };
+
+  // Restore concurrency control and loop
+  const concurrency = queueConfig.maxConcurrentTransfers;
+
+  while (!stopWorkers) {
+      let processedInLoop = 0;
+      const transportQueue = queue.getFilesInQueue('transport');
+      const processingCount = queue.getProcessingSet('transport')?.size ?? 0;
+
+      if (transportQueue.length > 0 && processingCount < concurrency!) {
+          const availableSlots = concurrency! - processingCount;
+          const filesToProcess = transportQueue.slice(0, availableSlots);
+
+          filesToProcess.forEach(file => {
+              if (!queue.getProcessingSet('transport')?.has(file.path)) {
+                  queue.getProcessingSet('transport')?.add(file.path);
+                  processFile(file).catch(e => { // Add catch
+                       logToFile(logFilePath, `[Transport Worker] Unhandled error processing ${file.path}: ${e.message}`)
+                       queue.getProcessingSet('transport')?.delete(file.path);
+                  });
+                  processedInLoop++;
+              }
+          });
+      }
+
+      // Use getDetailedQueueStats for idle check
+      const stats = queue.getDetailedQueueStats();
+      if (transportQueue.length === 0 && processingCount === 0 &&
+          // Check if upstream (packaging) is idle
+          (stats.packaging.waiting === 0))
+      {
+          await logToFile(logFilePath, "[Transport Worker] Transport queue empty and packaging likely done, waiting for global stop.");
+      }
+      await new Promise(resolve => setTimeout(resolve, 500));
+  }
+
+  await logToFile(logFilePath, "[Transport Worker] Stopped.");
+}
+
+export async function scanAndTransport(config: ScanAndTransportConfig): Promise<ScanAndTransportResult> {
+  const startTime = new Date();
+  const taskId = config.taskId || `task-${Date.now()}`;
+  const scanId = `scan-${Date.now()}`;
+  stopWorkers = false; // Reset global stop flag at the beginning
+
+  // --- Config Validation and Defaults ---
+  if (!config.rootDir || !await fs.pathExists(config.rootDir)) {
+     throw new Error('Invalid configuration: rootDir is required and must exist.');
+  }
+  const outputDir = path.resolve(config.outputDir ?? DEFAULT_OUTPUT_DIR);
+  const resultsDir = path.resolve(config.resultsDir ?? DEFAULT_RESULTS_DIR);
+  await fs.ensureDir(outputDir);
+  await fs.ensureDir(resultsDir);
+
+  const logFilePath = config.logFilePath ? path.resolve(config.logFilePath) : getDefaultLogFilePath();
+  await fs.ensureFile(logFilePath);
+  await logToFile(logFilePath, `--- ScanAndTransport Start (Pipeline Mode) ---`);
+  // ... (log initial config)
+
+  // --- Setup Queue and Stability Config --- (Restore correct merging and instantiation)
+  const mergedQueueConfig: QueueConfig = {
+    ...DEFAULT_QUEUE_CONFIG,
+    ...(config.queue ?? {}) // Ensure config.queue is handled if undefined
+    // Remove maxConcurrentPackaging
+  };
+  const mergedStabilityConfig: StabilityConfig = {
+      base: { ...DEFAULT_STABILITY_CONFIG.base, ...(config.stability?.base ?? {}) },
+      file: { ...DEFAULT_STABILITY_CONFIG.file, ...(config.stability?.file ?? {}) },
+      archive: { ...DEFAULT_STABILITY_CONFIG.archive, ...(config.stability?.archive ?? {}) }
+  };
+  // Instantiate queue correctly
+  const queue = new FileProcessingQueue(mergedQueueConfig, mergedStabilityConfig);
+
+  // --- Results Tracking --- (Restore original)
+  const matchedFiles: FileItem[] = []; // Track initially matched files if needed
+  const failedItems: FailureItem[] = [];
+  const packagePaths: string[] = [];
+  const transportResults: { success: boolean; filePath: string; remotePath: string; error?: string }[] = [];
+
+  // --- Completion Tracking --- (Restore original)
+  let totalFilesScanned = 0;
+  let processedCount = 0;
+  let failedCount = 0;
+
+  // --- Define handleFileCompletion --- (Restore original logic, fix FailureType)
+  const handleFileCompletion = async (file: FileItem, success: boolean, failureInfo?: FailureItem) => {
+      const uniqueId = file.path; // Use path as the unique identifier
+
+      // Ensure completion isn't resolved multiple times
+      // This simple check might need refinement if racing conditions are complex
+      if (processedCount + failedCount >= totalFilesScanned && totalFilesScanned > 0) {
+          // Already completed, log if needed but don't change counts or resolve again
+          await logToFile(logFilePath, `[Completion] Received completion for ${uniqueId} after primary completion signal.`);
+          // Still mark in queue if necessary?
+          if(success) queue.markAsCompleted(uniqueId);
+          else queue.markAsFailed(uniqueId, failureInfo);
+          return;
+      }
+
+      if (success) {
+          processedCount++;
+          // Remove entryPath
+          await logToFile(logFilePath, `[Completion] 文件成功处理: ${file.path}. Progress: ${processedCount + failedCount}/${totalFilesScanned}`);
+          queue.markAsCompleted(uniqueId);
+      } else {
+          failedCount++;
+          if (failureInfo) {
+              failedItems.push(failureInfo);
+              // Remove entryPath
+              await logToFile(logFilePath, `[Completion] 文件处理失败: ${failureInfo.path}. Error: ${failureInfo.error}. Progress: ${processedCount + failedCount}/${totalFilesScanned}`);
+          } else {
+              // Use a valid FailureType like 'scanError' if 'processing' is not valid
+              const genericFailure: FailureItem = { type: 'scanError', path: file.path, error: 'Unknown processing error' };
+              failedItems.push(genericFailure);
+              await logToFile(logFilePath, `[Completion] 文件处理失败 (unknown): ${file.path}. Progress: ${processedCount + failedCount}/${totalFilesScanned}`);
+          }
+          queue.markAsFailed(uniqueId, failureInfo);
+      }
+
+      // Check completion condition (Restore original)
+      if (totalFilesScanned > 0 && (processedCount + failedCount >= totalFilesScanned)) {
+          await logToFile(logFilePath, `[Completion] 所有 ${totalFilesScanned} 文件已处理完毕 (Success: ${processedCount}, Failed: ${failedCount}).`);
+          // No need to mark upstream done here, resolve is enough
+          return; // Resolve the main promise
+      } else if (totalFilesScanned === 0 && failedCount === 0 && processedCount === 0) {
+          await logToFile(logFilePath, `[Completion] 未扫描到需要处理的文件.`);
+          return; // Resolve if scan found nothing
+      }
+  };
+
+
+  // --- Result Object --- (Define structure according to type)
+  const result: ScanAndTransportResult = {
+    success: false, // Will be updated in finally block
+    processedFiles: [], // Note: Not populated in pipeline mode
+    failedItems: failedItems,
+    packagePaths: packagePaths,
+    transportSummary: transportResults,
+    logFilePath: logFilePath,
+    taskId: taskId,
+    scanId: scanId,
+    resultFilePath: getResultFilePath(resultsDir, taskId, scanId),
+    startTime: startTime,
+    endTime: new Date(), // Placeholder, updated in finally
+    elapsedTimeMs: 0 // Placeholder, updated in finally
+  };
+
+  // --- Worker Promises --- (Define before try block)
+  let stabilityWorkerPromise: Promise<void> | undefined;
+  let md5WorkerPromise: Promise<void> | undefined;
+  let packagingWorkerPromise: Promise<void> | undefined;
+  let transportWorkerPromise: Promise<void> | undefined;
+
+  try {
+    // --- Start Workers ---
+    await logToFile(logFilePath, "启动处理 Workers...");
+    stabilityWorkerPromise = runStabilityWorker(queue, config, mergedQueueConfig, logFilePath, handleFileCompletion);
+    md5WorkerPromise = runMd5Worker(queue, config, mergedQueueConfig, logFilePath, handleFileCompletion);
+    packagingWorkerPromise = runPackagingWorker(queue, config, logFilePath, packagePaths, handleFileCompletion, taskId, scanId, outputDir, config.packageNamePattern || DEFAULT_PACKAGE_NAME_PATTERN);
+    transportWorkerPromise = runTransportWorker(queue, config, mergedQueueConfig, logFilePath, transportResults, taskId, scanId);
+
+    // --- Start Scan --- (Restore scanFiles usage)
+    const scanOptions: ScanOptions = {
+      rootDir: path.resolve(config.rootDir),
+      matchRules: config.rules,
+      depth: config.depth ?? DEFAULT_DEPTH,
+      maxFileSize: config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE,
+      skipDirs: (config.skipDirs ?? DEFAULT_SKIP_DIRS).map(dir => path.resolve(config.rootDir, dir)),
+      scanNestedArchives: config.scanNestedArchives ?? DEFAULT_SCAN_NESTED_ARCHIVES,
+      maxNestedLevel: config.maxNestedLevel ?? DEFAULT_MAX_NESTED_LEVEL,
+      taskId: taskId,
+      // Use ts-ignore to suppress type mismatch for onProgress
+      // @ts-ignore
+      onProgress: (progress: any, file: any) => {
+        if (config.onProgress) {
+          config.onProgress(progress, file);
+        } else {
+            // Default logging (can use progress if needed)
+            // logToFile(logFilePath, `Scanning Dir: ${path.relative(config.rootDir, progress.currentDir) || '.'}...`);
+        }
+      },
+      onFileMatched: (file, progress) => {
+        matchedFiles.push(file); // Track matched files
+        if (file.origin === 'archive') {
+            queue.addToQueue('archiveStability', file);
+        } else {
+            queue.addToQueue('fileStability', file);
+        }
+        if (config.onProgress) { config.onProgress(progress, file); }
+      },
+      onFailure: (failure, progress) => {
+        // Use valid FailureType 'scanError'
+        const scanFailure: FailureItem = { ...failure, type: 'scanError' };
+        failedItems.push(scanFailure);
+        failedCount++;
+        logToFile(logFilePath, `扫描失败: ${failure.path}, 类型: ${failure.type}, 错误: ${failure.error}`);
+        if (config.onProgress) { config.onProgress(progress); }
+      }
+    };
+
+    await logToFile(logFilePath, "开始扫描文件...");
+    const scanResult = await scanFiles(scanOptions);
+    totalFilesScanned = scanResult.matchedFiles.length;
+    const scanErrorCount = failedItems.filter(f => f.type === 'scanError').length; // Count scan-specific errors
+    await logToFile(logFilePath, `扫描完成，找到 ${totalFilesScanned} 个匹配文件，扫描失败 ${scanErrorCount} 个`);
+
+    // --- Wait for Queue Idle ---
+    let shouldExitEarly = false;
+    await logToFile(logFilePath, "Briefly pausing to allow queue population...");
+    await new Promise(resolve => setTimeout(resolve, 100)); // Small delay
+
+    if (totalFilesScanned === 0) {
+        await logToFile(logFilePath, "未找到匹配文件，无需等待队列。");
+        shouldExitEarly = true;
+    } else if (failedCount >= totalFilesScanned) {
+         await logToFile(logFilePath, `所有扫描到的文件在扫描阶段已失败，任务完成。`);
+         shouldExitEarly = true;
+    }
+
+    if (!shouldExitEarly) {
+        await logToFile(logFilePath, "Scan complete. Waiting for all processing queues to become idle...");
+        let idleCheckCounter = 0;
+        while (!isQueueTrulyIdle(queue)) {
+             idleCheckCounter++;
+             if (idleCheckCounter % 20 === 0) {
+                 const stats = queue.getDetailedQueueStats();
+                 await logToFile(logFilePath, `Waiting for idle (${idleCheckCounter/2}s): ${JSON.stringify(stats)}`);
+             }
+             await new Promise(resolve => setTimeout(resolve, 500));
+             if (stopWorkers) {
+                 await logToFile(logFilePath, "Stop signal received while waiting for idle. Breaking wait loop.");
+                 break;
+             }
+        }
+        if (!stopWorkers) {
+             await logToFile(logFilePath, "All processing queues are idle.");
+        }
+    }
+  
+    // --- Signal Workers to Stop --- (Keep this part)
+    await logToFile(logFilePath, "Signaling workers to stop...");
+    stopWorkers = true;
+    // Remove queue.signalStop()
+
+    // --- Wait for Workers to Fully Stop --- (Keep this part)
+    await logToFile(logFilePath, "[Main] Waiting for all workers to finish cleanup and stop...");
+    const workerPromises = [stabilityWorkerPromise, md5WorkerPromise, packagingWorkerPromise, transportWorkerPromise].filter(p => p !== undefined) as Promise<void>[];
+    await Promise.all(workerPromises);
+    await logToFile(logFilePath, "[Main] All workers have stopped.");
+
+  } catch (error: any) {
+    // Restore top-level error handling
+    failedCount++;
+    // Use 'scanError' or a more generic type if applicable
+    failedItems.push({ type: 'scanError', path: config.rootDir, error: `顶层错误: ${error.message || String(error)}` });
+    await logToFile(logFilePath, `*** 顶层错误: ${error.message || String(error)} ***`);
+    console.error('Error during scanAndTransport:', error);
+    if (failedCount >= totalFilesScanned || totalFilesScanned === 0) {
+        // Ensure completion is resolved if an error occurs before normal completion
+        return result;
+    }
+    stopWorkers = true;
+  } finally {
+    // --- Wait for Workers in Finally (Best Effort) --- (Keep this part)
+    if (stopWorkers) {
+        await logToFile(logFilePath, `[Main - Finally] Ensuring workers stop and waiting...`);
+        const workerPromises = [stabilityWorkerPromise, md5WorkerPromise, packagingWorkerPromise, transportWorkerPromise].filter(p => p !== undefined) as Promise<void>[];
+        try {
+            await Promise.race([
+                Promise.all(workerPromises),
+                new Promise((_, reject) => setTimeout(() => reject(new Error("Worker stop timeout")), 10000)) // 10 sec timeout
+            ]);
+            await logToFile(logFilePath, `[Main - Finally] All workers confirmed stopped.`);
+        } catch (stopTimeoutError: any) {
+             await logToFile(logFilePath, `[Main - Finally] Warning: ${stopTimeoutError.message}. Proceeding with results.`);
+        }
+    }
+
+    // --- Finalize Results --- (Restore structure)
+    const endTime = new Date();
+    const elapsedTimeMs = endTime.getTime() - startTime.getTime();
+    // Calculate final success based only on failedItems count vs total scanned
+    const finalSuccess = failedItems.length === 0 && totalFilesScanned > 0;
+
+    // Update the result object defined earlier
+    result.success = finalSuccess;
+    result.failedItems = failedItems;
+    result.packagePaths = packagePaths;
+    result.transportSummary = transportResults;
+    result.endTime = endTime;
+    result.elapsedTimeMs = elapsedTimeMs;
+    // Remove properties not in ScanAndTransportResult type
+    // result.rootDir, filesScanned, filesMatched, etc.
+
+    await logToFile(logFilePath, `--- ScanAndTransport End (Pipeline Mode) ---`);
+    await logToFile(logFilePath, `结束时间: ${endTime.toISOString()}`);
+    await logToFile(logFilePath, `耗时: ${elapsedTimeMs}ms`);
+    await logToFile(logFilePath, `成功: ${result.success}`);
+    await logToFile(logFilePath, `失败项数: ${failedItems.length}`); // Based on collected failures
+    await logToFile(logFilePath, `扫描匹配文件数: ${totalFilesScanned}`);
+    await logToFile(logFilePath, `包数量: ${packagePaths.length}`);
+    // Save results *before* trying to upload
+    await saveResultToFile(result.resultFilePath, result);
+    await logToFile(logFilePath, `结果已保存到: ${result.resultFilePath}`);
+
+    // --- Upload Results/Logs --- (Fix transferFile call)
+    if (config.transport?.enabled) {
+       const transportConfig = config.transport;
+       const remoteSubDir = `${taskId}-${scanId}`;
+       try {
+           // Upload Result File
+           await logToFile(logFilePath, `准备上传结果文件: ${result.resultFilePath}`);
+           // Construct relative path for transferFile
+           const relativeResultPath = path.posix.join(remoteSubDir, path.basename(result.resultFilePath));
+           // Ensure transportConfig used here includes necessary fields like packageSize
+           const resultTransportOpts: TransportOptions = {
+                // Copy known fields from transportConfig
+                protocol: transportConfig.protocol,
+                host: transportConfig.host,
+                port: transportConfig.port,
+                username: transportConfig.username,
+                password: transportConfig.password,
+                remotePath: transportConfig.remotePath,
+                enabled: true,
+                // Use defaults for potentially missing fields
+                retryCount: DEFAULT_TRANSPORT_RETRY_COUNT,
+                timeout: DEFAULT_TRANSPORT_TIMEOUT,
+                debug: false,
+                packageSize: 1 // Add required packageSize
+           };
+             // Correct transferFile call (use relative path)
+             const resultUploadResult = await transferFile(result.resultFilePath, relativeResultPath, resultTransportOpts);
+             if (resultUploadResult.success) {
+                 // Log the full expected path for clarity
+                 const fullRemotePath = path.posix.join(transportConfig.remotePath || '/', relativeResultPath);
+                 await logToFile(logFilePath, `结果文件上传成功: ${fullRemotePath}`);
+             } else {
+                 await logToFile(logFilePath, `上传结果文件失败: ${resultUploadResult.error}`);
+             }
+       } catch (e: any) {
+           await logToFile(logFilePath, `上传结果文件时发生异常: ${e.message}`);
+       }
+       try {
+           // Upload Log File
+           await logToFile(logFilePath, `准备上传日志文件: ${logFilePath}`);
+           // Construct relative path for transferFile
+           const relativeLogPath = path.posix.join(remoteSubDir, path.basename(logFilePath));
+           // Ensure transportConfig used here includes necessary fields like packageSize
+           const logTransportOpts: TransportOptions = {
+                // Copy known fields from transportConfig
+                protocol: transportConfig.protocol,
+                host: transportConfig.host,
+                port: transportConfig.port,
+                username: transportConfig.username,
+                password: transportConfig.password,
+                remotePath: transportConfig.remotePath,
+                enabled: true,
+                // Use defaults for potentially missing fields
+                retryCount: DEFAULT_TRANSPORT_RETRY_COUNT,
+                timeout: DEFAULT_TRANSPORT_TIMEOUT,
+                debug: false,
+                packageSize: 1 // Add required packageSize
+           };
+             // Correct transferFile call (use relative path)
+             const logUploadResult = await transferFile(logFilePath, relativeLogPath, logTransportOpts);
+             if (logUploadResult.success) {
+                 // Log the full expected path for clarity
+                 const fullRemotePath = path.posix.join(transportConfig.remotePath || '/', relativeLogPath);
+                 await logToFile(logFilePath, `日志文件上传成功: ${fullRemotePath}`);
+             } else {
+                 await logToFile(logFilePath, `上传日志文件失败: ${logUploadResult.error}`);
+             }
+       } catch (e: any) {
+           await logToFile(logFilePath, `上传日志文件时发生异常: ${e.message}`);
+       }
+    }
+
+    return result; // Return the final result object
   }
 } 

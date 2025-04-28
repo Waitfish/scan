@@ -29,8 +29,8 @@ export interface FileItem {
   modifyTime: Date;
   /** 文件大小（字节）(对于压缩包内文件，指未压缩的大小) */
   size: number;
-  /** 文件来源: 'filesystem' 或 'archive' */
-  origin?: 'filesystem' | 'archive';
+  /** 文件来源: 'filesystem', 'archive' 或 'package' */
+  origin?: 'filesystem' | 'archive' | 'package';
   /** 如果来源是 'archive'，则为压缩包的绝对路径 */
   archivePath?: string;
   /** 如果来源是 'archive'，则为文件在压缩包内的相对路径 */
