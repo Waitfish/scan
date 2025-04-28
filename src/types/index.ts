@@ -3,7 +3,19 @@
  */
 
 import { PackagingTriggerOptions } from './facade'; // Import from facade temporarily
+// 重构后的接口导入
+import { ScanOptions as NewScanOptions, ScanResult as NewScanResult } from './scanner';
+import { QueueConfig, StabilityConfig } from './queue';
 
+// 导出重构后的接口
+export { 
+  NewScanOptions, 
+  NewScanResult,
+  QueueConfig,
+  StabilityConfig
+};
+
+// 原有接口定义 (后续重构将逐步移除)
 export interface FileItem {
   /** 文件绝对路径 (对于压缩包内文件，指压缩包的路径) */
   path: string;
@@ -34,6 +46,7 @@ export type MatchRule = [string[], string];
 
 /**
  * 文件稳定性检测选项
+ * @deprecated 将在重构后删除，请使用 QueueConfig 和 StabilityConfig 接口替代
  */
 export interface StabilityCheckOptions {
   /** 是否启用文件稳定性检测 */
@@ -52,6 +65,7 @@ export interface StabilityCheckOptions {
 
 /**
  * 队列系统选项
+ * @deprecated 将在重构后删除，请使用 QueueConfig 接口替代
  */
 export interface QueueOptions {
   /** 是否启用队列系统 */
@@ -92,6 +106,9 @@ export interface TransportOptions {
   debug?: boolean;
 }
 
+/**
+ * @deprecated 将在重构后删除，请使用 NewScanOptions 替代
+ */
 export interface ScanOptions {
   /** 扫描的根目录 */
   rootDir: string;
@@ -168,7 +185,10 @@ export interface ScanProgress {
  */
 export interface FailureItem {
   /** 失败类型 */
-  type: 'directoryAccess' | 'fileStat' | 'archiveOpen' | 'archiveEntry' | 'rarOpen' | 'nestedArchive' | 'stability' | 'md5' | 'packaging' | 'transport' | 'scanError';
+  type: 'directoryAccess' | 'fileStat' | 'archiveOpen' | 'archiveEntry' | 
+        'rarOpen' | 'nestedArchive' | 'stability' | 'md5' | 'packaging' | 
+        'transport' | 'scanError' | 'archiveStability' | 'extractArchive' |
+        'ignoredLargeFile';
   /** 发生失败的文件、目录或压缩包的路径 */
   path: string;
   /** 如果是压缩包内条目处理失败，这里是内部路径 */
@@ -177,6 +197,8 @@ export interface FailureItem {
   error: string;
   /** 嵌套层级 */
   nestedLevel?: number;
+  /** 受影响的文件列表 (用于压缩包稳定性失败) */
+  affectedFiles?: string[];
 }
 
 /**
@@ -237,6 +259,7 @@ export interface PackageMetadata {
 
 /**
  * scanFiles 函数的返回结果
+ * @deprecated 将在重构后删除，请使用 NewScanResult 替代
  */
 export interface ScanResult {
   /** 成功匹配的文件列表 */

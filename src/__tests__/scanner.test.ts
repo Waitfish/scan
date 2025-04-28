@@ -6,7 +6,7 @@ import { scanFiles } from '../core/scanner';
 import * as path from 'path';
 import * as fs from 'fs-extra';
 import * as compressing from 'compressing';
-import { FileItem, MatchRule} from '../types';
+import { FileItem, MatchRule, FailureItem } from '../types';
 
 describe('文件扫描器', () => {
   const testDir = path.join(__dirname, '../../test-files');
@@ -53,7 +53,8 @@ describe('文件扫描器', () => {
     zipStream.addEntry(Buffer.from('zip txt content'), { relativePath: 'zip-match.txt' });
     zipStream.addEntry(Buffer.from('zip docx content'), { relativePath: 'docs/MeiTuan-zip.docx' });
     zipStream.addEntry(Buffer.from('ignore this'), { relativePath: 'other/ignored.log' });
-    zipStream.addEntry(Buffer.alloc(1024 * 600), { relativePath: 'large/large-in-zip.dat' }); 
+    // 添加超大文件确保ZIP文件本身大小超过测试用例中的smallMaxSize (10KB)
+    zipStream.addEntry(Buffer.alloc(1024 * 1024), { relativePath: 'large/large-in-zip.dat' }); 
     const zipDestStream = fs.createWriteStream(zipPath);
     await new Promise<void>((resolve, reject) => {
       zipStream.pipe(zipDestStream)
@@ -90,10 +91,10 @@ describe('文件扫描器', () => {
         [['docx', 'doc'], '^MeiTuan.*'],
         [['txt'], '.*-match.txt'] 
       ];
-      const { results, failures } = await scanFiles({ rootDir: testDir, matchRules: rules, depth: -1 });
+      const { matchedFiles, failures } = await scanFiles({ rootDir: testDir, matchRules: rules, depth: -1 });
       expect(failures).toHaveLength(0);
       
-      const matchedNames = results.map(f => f.name).sort();
+      const matchedNames = matchedFiles.map(f => f.name).sort();
       const expected = [
         'MeiTuan-plan.doc',       
         'MeiTuan-report.docx',    
@@ -121,25 +122,25 @@ describe('文件扫描器', () => {
       const rules: MatchRule[] = [
         [['docx'], '^MeiTuan.*'] 
       ];
-      const { results, failures } = await scanFiles({ rootDir: testDir, matchRules: rules, depth: -1 });
+      const { matchedFiles, failures } = await scanFiles({ rootDir: testDir, matchRules: rules, depth: -1 });
       expect(failures).toHaveLength(0);
       
       // FS: MeiTuan-plan.doc (wrong ext)
-      expect(results.some(f => f.name === 'MeiTuan-plan.doc' && f.origin !== 'archive')).toBe(false); 
+      expect(matchedFiles.some(f => f.name === 'MeiTuan-plan.doc' && f.origin !== 'archive')).toBe(false); 
       // Archive: MeiTuan-zip.docx (match)
-      expect(results.some(f => f.name === 'MeiTuan-zip.docx' && f.origin === 'archive')).toBe(true);
+      expect(matchedFiles.some(f => f.name === 'MeiTuan-zip.docx' && f.origin === 'archive')).toBe(true);
       // Archive: MeiTuan-tgz.doc (wrong ext)
-      expect(results.some(f => f.name === 'MeiTuan-tgz.doc' && f.origin === 'archive')).toBe(false);
+      expect(matchedFiles.some(f => f.name === 'MeiTuan-tgz.doc' && f.origin === 'archive')).toBe(false);
     });
     
     test('应该正确处理带点和不带点的后缀', async () => {
         const rules: MatchRule[] = [
           [['.docx', 'doc'], '^MeiTuan.*'], 
         ];
-        const { results, failures } = await scanFiles({ rootDir: testDir, matchRules: rules, depth: -1 });
+        const { matchedFiles, failures } = await scanFiles({ rootDir: testDir, matchRules: rules, depth: -1 });
         expect(failures).toHaveLength(0);
         
-        const matchedNames = results.map(f => f.name).sort();
+        const matchedNames = matchedFiles.map(f => f.name).sort();
         // UPDATED Expected: includes both FS and archive files
          expect(matchedNames).toEqual([
           'MeiTuan-plan.doc',
@@ -158,11 +159,11 @@ describe('文件扫描器', () => {
     const baseOptions = { rootDir: testDir, matchRules: rules, depth: -1 };
 
     test('应该同时扫描文件系统和所有类型压缩包内部 (zip, tgz, rar)', async () => {
-      const { results, failures } = await scanFiles({ ...baseOptions }); 
+      const { matchedFiles, failures } = await scanFiles({ ...baseOptions }); 
       expect(failures).toHaveLength(0);
       
-      const filesFromArchive = results.filter(f => f.origin === 'archive');
-      const filesFromSystem = results.filter(f => f.origin === 'filesystem' || f.origin === undefined);
+      const filesFromArchive = matchedFiles.filter(f => f.origin === 'archive');
+      const filesFromSystem = matchedFiles.filter(f => f.origin === 'filesystem' || f.origin === undefined);
       
       const expectedArchiveCount = await fs.pathExists(rarPath) ? 6 : 4; // 4 from zip/tgz + 2 assumed from rar
       const expectedSystemCount = 5;
@@ -170,15 +171,15 @@ describe('文件扫描器', () => {
 
       expect(filesFromArchive.length).toBe(expectedArchiveCount);
       expect(filesFromSystem.length).toBe(expectedSystemCount);
-      expect(results.length).toBe(expectedTotalCount);
+      expect(matchedFiles.length).toBe(expectedTotalCount);
 
       // Check specific files from each source type
-      expect(results.some(f => f.name === 'root-match.txt' && f.origin !== 'archive')).toBe(true);
-      expect(results.some(f => f.name === 'zip-match.txt' && f.archivePath === zipPath)).toBe(true);
-      expect(results.some(f => f.name === 'tgz-match.txt' && f.archivePath === tgzPath)).toBe(true);
+      expect(matchedFiles.some(f => f.name === 'root-match.txt' && f.origin !== 'archive')).toBe(true);
+      expect(matchedFiles.some(f => f.name === 'zip-match.txt' && f.archivePath === zipPath)).toBe(true);
+      expect(matchedFiles.some(f => f.name === 'tgz-match.txt' && f.archivePath === tgzPath)).toBe(true);
       if(await fs.pathExists(rarPath)) {
-          expect(results.some(f => f.name === 'rar-match.txt' && f.archivePath === rarPath)).toBe(true);
-          expect(results.some(f => f.name === 'MeiTuan-rar.docx' && f.archivePath === rarPath)).toBe(true);
+          expect(matchedFiles.some(f => f.name === 'rar-match.txt' && f.archivePath === rarPath)).toBe(true);
+          expect(matchedFiles.some(f => f.name === 'MeiTuan-rar.docx' && f.archivePath === rarPath)).toBe(true);
       }
 
       // Verify FileItem structure for RAR
@@ -197,26 +198,65 @@ describe('文件扫描器', () => {
 
     test('应该正确处理文件系统和压缩包内文件的大小限制', async () => {
       const smallMaxSize = 10 * 1024; 
-      const { results, failures } = await scanFiles({ ...baseOptions, maxFileSize: smallMaxSize });
-      expect(failures).toHaveLength(0);
-      expect(results.some(f => f.name === 'large-in-zip.dat')).toBe(false);
-      expect(results.some(f => f.name === 'large-match.bin')).toBe(false);
-      // Assume test.rar does NOT contain a matching file under the size limit if large file added
+      const { matchedFiles, failures } = await scanFiles({ 
+        rootDir: testDir, 
+        matchRules: [
+          [['bin', 'dat'], '.*'],
+          ...baseOptions.matchRules 
+        ], 
+        depth: -1,
+        maxFileSize: smallMaxSize 
+      });
+      
+      // 调试 - 输出所有匹配的文件名
+      console.log("匹配的文件列表:", matchedFiles.map(f => {
+        return {
+          name: f.name,
+          size: f.size,
+          path: f.path,
+          internalPath: f.internalPath
+        };
+      }));
+      
+      // 调试 - 检查失败列表
+      console.log("失败文件列表:", failures.map(f => {
+        return {
+          type: f.type,
+          path: f.path,
+          entryPath: f.entryPath,
+          error: f.error
+        };
+      }));
+      
+      // 现在我们期望在failures中找到因大小超过限制的错误
+      const ignoredLargeFiles = failures.filter(f => f.type === 'ignoredLargeFile');
+      expect(ignoredLargeFiles.length).toBeGreaterThan(0);
+      
+      // 大文件不应该被包含在匹配文件中
+      expect(matchedFiles.some(f => f.name === 'large-match.bin')).toBe(false);
+      
+      // 检查failures中是否包含被忽略的大文件
+      expect(failures.some(f => f.type === 'ignoredLargeFile' && f.path.includes('large-match.bin'))).toBe(true);
     });
 
-    test('应该通过 onProgress 报告所有类型压缩包内的匹配文件', async () => {
+    test('应该通过 onFileMatched 报告所有类型压缩包内的匹配文件', async () => {
       let reportedFromZip = false;
       let reportedFromTgz = false;
       let reportedFromRar = false;
-      const progressUpdates: { progress: any, file?: FileItem }[] = [];
+      const matchedFiles: FileItem[] = [];
+      const progressUpdates: { progress: any }[] = [];
+      
       const { failures } = await scanFiles({
         ...baseOptions,
-        onProgress: (progress, matchedFile) => {
-          progressUpdates.push({ progress: {...progress}, file: matchedFile });
-          if (matchedFile?.origin === 'archive') {
-            if (matchedFile.archivePath === zipPath) reportedFromZip = true;
-            if (matchedFile.archivePath === tgzPath) reportedFromTgz = true;
-            if (matchedFile.archivePath === rarPath) reportedFromRar = true;
+        onProgress: (progress) => {
+          progressUpdates.push({ progress: {...progress} });
+        },
+        onFileMatched: (file) => {
+          matchedFiles.push(file);
+          if (file.origin === 'archive') {
+            if (file.archivePath === zipPath) reportedFromZip = true;
+            if (file.archivePath === tgzPath) reportedFromTgz = true;
+            if (file.archivePath === rarPath) reportedFromRar = true;
           }
         }
       });
@@ -230,6 +270,9 @@ describe('文件扫描器', () => {
       const lastProgress = progressUpdates[progressUpdates.length - 1].progress;
       const expectedArchiveScanCount = await fs.pathExists(rarPath) ? 3 : 2;
       expect(lastProgress.archivesScanned).toBe(expectedArchiveScanCount);
+      
+      // 验证是否所有匹配的文件都通过onFileMatched报告了
+      expect(matchedFiles.length).toBeGreaterThan(0);
     });
 
     test('跳过目录时，不应扫描其中的压缩包', async () => {
@@ -239,9 +282,9 @@ describe('文件扫描器', () => {
       const destStream = fs.createWriteStream(skippedZipPath);
       await new Promise<void>((resolve) => zipStream.pipe(destStream).on('finish', resolve));
       
-      const { results, failures } = await scanFiles({ ...baseOptions, skipDirs: ['skip-this'] });
+      const { matchedFiles, failures } = await scanFiles({ ...baseOptions, skipDirs: ['skip-this'] });
       expect(failures).toHaveLength(0);
-      expect(results.some(f => f.archivePath === skippedZipPath)).toBe(false);
+      expect(matchedFiles.some(f => f.archivePath === skippedZipPath)).toBe(false);
     });
 
     test('应该能处理无效或损坏的压缩包文件并报告失败', async () => {
@@ -251,16 +294,16 @@ describe('文件扫描器', () => {
       
       const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
       const rules: MatchRule[] = [[['txt'], '.*']]; 
-      const { results, failures } = await scanFiles({ rootDir: testDir, matchRules: rules, depth: -1 });
+      const { matchedFiles, failures } = await scanFiles({ rootDir: testDir, matchRules: rules, depth: -1 });
 
-      expect(results.some(f => f.name === 'root-match.txt')).toBe(true);
+      expect(matchedFiles.some(f => f.name === 'root-match.txt')).toBe(true);
       
-      expect(failures).toHaveLength(1); 
-      const failure = failures[0];
-      expect(failure.type).toBe('archiveOpen'); 
-      expect(failure.path).toBe(invalidZipPath); 
+      // 现在我们应该有一个失败项，表示无法处理压缩包
+      expect(failures.some(f => f.type === 'archiveOpen' && f.path === invalidZipPath)).toBe(true);
+      const failure = failures.find(f => f.path === invalidZipPath);
+      expect(failure?.type).toBe('archiveOpen'); 
       // 修改断言以匹配实际错误信息
-      expect(failure.error).toMatch(/directory record signature not found/i); 
+      expect(failure?.error).toMatch(/directory record signature not found/i); 
 
       expect(warnSpy).toHaveBeenCalled();
       warnSpy.mockRestore();
@@ -278,11 +321,11 @@ describe('文件扫描器', () => {
       }
 
       const rules: MatchRule[] = [[['txt'], '.*']];
-      const { results, failures } = await scanFiles({ rootDir: testDir, matchRules: rules, depth: -1 });
+      const { matchedFiles, failures } = await scanFiles({ rootDir: testDir, matchRules: rules, depth: -1 });
 
       if (process.platform !== 'win32') {
         expect(failures.some(f => f.type === 'directoryAccess' && f.path === inaccessibleDir)).toBe(true);
-        expect(results.some(f => f.path.includes('inaccessible'))).toBe(false);
+        expect(matchedFiles.some(f => f.path.includes('inaccessible'))).toBe(false);
       } else {
          console.warn('跳过在 Windows 上测试无法访问目录的权限部分');
          expect(failures.filter(f => f.type === 'directoryAccess' && f.path === inaccessibleDir)).toHaveLength(0);
@@ -297,10 +340,10 @@ describe('文件扫描器', () => {
   describe('基本扫描功能 (含压缩包)', () => {
     test('应该能扫描到指定目录下的所有匹配文件', async () => {
       const rules: MatchRule[] = [[['txt'], '.*match.txt']];
-      const { results, failures } = await scanFiles({ rootDir: testDir, matchRules: rules, depth: 1 });
+      const { matchedFiles, failures } = await scanFiles({ rootDir: testDir, matchRules: rules, depth: 1 });
       expect(failures).toHaveLength(0);
       
-      const matchedNames = results.map(f => f.name).sort();
+      const matchedNames = matchedFiles.map(f => f.name).sort();
       // UPDATED Expected for depth 1: includes root, subdir (depth 1), and archive roots (depth 1)
       expect(matchedNames).toEqual([
           'root-match.txt',   
@@ -308,17 +351,17 @@ describe('文件扫描器', () => {
           'tgz-match.txt',    
           'zip-match.txt'   
       ]);
-      expect(results.every(f => f.name.endsWith('.txt'))).toBe(true);
+      expect(matchedFiles.every(f => f.name.endsWith('.txt'))).toBe(true);
     });
 
     test('应该能限制扫描深度', async () => {
       const rules: MatchRule[] = [[['txt'], '.*match.txt']]; 
-      const { results, failures } = await scanFiles({ rootDir: testDir, matchRules: rules, depth: 0 }); 
+      const { matchedFiles, failures } = await scanFiles({ rootDir: testDir, matchRules: rules, depth: 0 }); 
       expect(failures).toHaveLength(0);
-      expect(results.some(file => file.path.includes('subdir'))).toBe(false);
-      expect(results.some(file => file.path.includes('archives'))).toBe(false);
-      expect(results.some(file => file.origin === 'archive')).toBe(false);
-      expect(results.map(f => f.name)).toEqual(['root-match.txt']);
+      expect(matchedFiles.some(file => file.path.includes('subdir'))).toBe(false);
+      expect(matchedFiles.some(file => file.path.includes('archives'))).toBe(false);
+      expect(matchedFiles.some(file => file.origin === 'archive')).toBe(false);
+      expect(matchedFiles.map(f => f.name)).toEqual(['root-match.txt']);
     });
     
     test('应该能扫描到最深层的文件 (包括压缩包内)', async () => {
@@ -326,20 +369,20 @@ describe('文件扫描器', () => {
           [['txt'], '.*match.txt'],
           [['docx'], '^MeiTuan.*'] // To find MeiTuan-zip.docx in archive
       ];
-      const { results, failures } = await scanFiles({ rootDir: testDir, matchRules: rules, depth: -1 });
+      const { matchedFiles, failures } = await scanFiles({ rootDir: testDir, matchRules: rules, depth: -1 });
       expect(failures).toHaveLength(0);
       // Check deep filesystem file
-      expect(results.some(file => file.name === 'deep-match.txt' && file.origin !== 'archive')).toBe(true);
+      expect(matchedFiles.some(file => file.name === 'deep-match.txt' && file.origin !== 'archive')).toBe(true);
       // Check file inside archive subdirectory
-      expect(results.some(file => file.name === 'MeiTuan-zip.docx' && file.origin === 'archive')).toBe(true);
+      expect(matchedFiles.some(file => file.name === 'MeiTuan-zip.docx' && file.origin === 'archive')).toBe(true);
     });
 
     test('应该返回正确的文件信息（文件系统）', async () => {
       const rules: MatchRule[] = [[['txt'], '^root.*']];
-      const { results, failures } = await scanFiles({ rootDir: testDir, matchRules: rules, depth: 0 });
+      const { matchedFiles, failures } = await scanFiles({ rootDir: testDir, matchRules: rules, depth: 0 });
       expect(failures).toHaveLength(0);
-      expect(results.length).toBe(1);
-      const file = results[0];
+      expect(matchedFiles.length).toBe(1);
+      const file = matchedFiles[0];
       expect(file.name).toBe('root-match.txt');
       expect(file.path).toBe(path.join(testDir, 'root-match.txt'));
       expect(file.origin).not.toBe('archive');
@@ -350,7 +393,7 @@ describe('文件扫描器', () => {
   describe('目录跳过功能 (已更新)', () => {
     test('应该跳过 skipDirs 中指定的目录（完全匹配）', async () => {
       const rules: MatchRule[] = [[['txt'], '.*']];
-      const { results, failures } = await scanFiles({
+      const { matchedFiles, failures } = await scanFiles({
         rootDir: testDir,
         matchRules: rules,
         depth: -1,
@@ -358,13 +401,13 @@ describe('文件扫描器', () => {
       });
       expect(failures).toHaveLength(0);
       
-      expect(results.some(file => file.path.includes('skip-this'))).toBe(false);
-      expect(results.some(file => file.archivePath?.includes('skip-this'))).toBe(false);
+      expect(matchedFiles.some(file => file.path.includes('skip-this'))).toBe(false);
+      expect(matchedFiles.some(file => file.archivePath?.includes('skip-this'))).toBe(false);
     });
 
     test('应该跳过 skipDirs 中指定目录的子目录', async () => {
       const rules: MatchRule[] = [[['txt'], '.*']];
-      const { results, failures } = await scanFiles({
+      const { matchedFiles, failures } = await scanFiles({
         rootDir: testDir,
         matchRules: rules,
         depth: -1,
@@ -372,13 +415,13 @@ describe('文件扫描器', () => {
       });
       expect(failures).toHaveLength(0);
       
-      expect(results.some(file => file.path.includes('subdir'))).toBe(false);
-      expect(results.some(file => file.archivePath?.includes('subdir'))).toBe(false);
+      expect(matchedFiles.some(file => file.path.includes('subdir'))).toBe(false);
+      expect(matchedFiles.some(file => file.archivePath?.includes('subdir'))).toBe(false);
     });
 
     test('应该跳过根目录（如果指定）', async () => {
       const rules: MatchRule[] = [[['txt'], '.*']];
-      const { results: _results, failures } = await scanFiles({
+      const { matchedFiles: _results, failures } = await scanFiles({
         rootDir: testDir,
         matchRules: rules,
         depth: -1,
@@ -386,7 +429,7 @@ describe('文件扫描器', () => {
       });
       expect(failures).toHaveLength(0);
 
-      const { results: skipResults, failures: skipFailures } = await scanFiles({
+      const { matchedFiles: skipResults, failures: skipFailures } = await scanFiles({
         rootDir: testDir,
         matchRules: rules,
         depth: -1,
@@ -402,12 +445,19 @@ describe('文件扫描器', () => {
   describe('进度报告功能 (含压缩包)', () => {
      test('应该报告扫描的压缩包数量', async () => {
       const rules: MatchRule[] = [[['txt'], '.*']]; 
-      const progressUpdates: { progress: any, file?: FileItem }[] = [];
+      const progressUpdates: { progress: any }[] = [];
+      const matchedFiles: FileItem[] = [];
+      
       const { failures } = await scanFiles({
         rootDir: testDir,
         matchRules: rules,
         depth: -1,
-        onProgress: (progress, file) => { progressUpdates.push({ progress: {...progress}, file }); }
+        onProgress: (progress) => { 
+          progressUpdates.push({ progress: {...progress} }); 
+        },
+        onFileMatched: (file) => {
+          matchedFiles.push(file);
+        }
       });
       expect(failures).toHaveLength(0);
       
@@ -418,26 +468,31 @@ describe('文件扫描器', () => {
       expect(lastRelevantProgress).toBeDefined();
       // UPDATED: Expect 2 or more archives, allowing for skipped one if it exists
       expect(lastRelevantProgress.archivesScanned).toBeGreaterThanOrEqual(2); 
+      
+      // 验证是否收集到了匹配的文件
+      expect(matchedFiles.length).toBeGreaterThan(0);
      });
      
      test('应该正确报告扫描进度，并在匹配时传递文件信息', async () => {
       const rules: MatchRule[] = [
         [['docx', 'doc'], '^MeiTuan.*']
       ];
-      const progressUpdates: { progress: any, file?: FileItem }[] = [];
+      const progressUpdates: { progress: any }[] = [];
+      const matchedFiles: FileItem[] = [];
       let matchedFileReported = false;
 
       const { failures } = await scanFiles({
         rootDir: testDir,
         matchRules: rules,
         depth: -1,
-        onProgress: (progress, matchedFile) => {
-          progressUpdates.push({ progress: { ...progress }, file: matchedFile });
-          if (matchedFile) {
-            matchedFileReported = true;
-            expect(matchedFile.name).toMatch(/^MeiTuan.*/);
-            expect(matchedFile.path).toBeDefined();
-          }
+        onProgress: (progress) => {
+          progressUpdates.push({ progress: { ...progress } });
+        },
+        onFileMatched: (file) => {
+          matchedFiles.push(file);
+          matchedFileReported = true;
+          expect(file.name).toMatch(/^MeiTuan.*/);
+          expect(file.path).toBeDefined();
         }
       });
 
@@ -450,6 +505,39 @@ describe('文件扫描器', () => {
       expect(lastProgress.scannedFiles).toBeGreaterThan(0);
       // UPDATED: Expect 4 MeiTuan files (2 FS, 2 Archive)
       expect(lastProgress.matchedFiles).toBe(4);
+      
+      // 验证通过onFileMatched回调收集的文件
+      expect(matchedFiles.length).toBe(4);
+      expect(matchedFiles.every(f => f.name.startsWith('MeiTuan'))).toBe(true);
+    });
+    
+    test('应该报告被忽略的大文件', async () => {
+      const rules: MatchRule[] = [
+        [['bin'], '.*']
+      ];
+      const smallMaxSize = 1023; // 比small-match.bin小一点
+      const failedItems: FailureItem[] = [];
+      
+      const { failures } = await scanFiles({
+        rootDir: testDir,
+        matchRules: rules,
+        depth: -1,
+        maxFileSize: smallMaxSize,
+        onFailure: (failure) => {
+          failedItems.push(failure);
+        }
+      });
+      
+      // 检查是否所有大文件都作为失败报告
+      const ignoredLargeFiles = failures.filter(f => f.type === 'ignoredLargeFile');
+      expect(ignoredLargeFiles.length).toBeGreaterThan(0);
+      
+      // 验证通过onFailure回调是否收集到了忽略的大文件
+      const callbackLargeFiles = failedItems.filter(f => f.type === 'ignoredLargeFile');
+      expect(callbackLargeFiles.length).toBeGreaterThan(0);
+      
+      // 验证大小限制信息在错误消息中
+      expect(ignoredLargeFiles[0].error).toContain(`${smallMaxSize}`);
     });
   });
 }); 

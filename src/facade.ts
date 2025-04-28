@@ -73,8 +73,13 @@ export async function scanAndTransport(config: ScanAndTransportConfig): Promise<
 
   // 2. 构建完整的 TransportOptions
   const transportOptions: TransportOptions = {
-    enabled: true, // 默认启用传输
-    ...config.transport,
+    enabled: config.transport.enabled !== undefined ? config.transport.enabled : true,
+    protocol: config.transport.protocol,
+    host: config.transport.host,
+    port: config.transport.port,
+    username: config.transport.username,
+    password: config.transport.password,
+    remotePath: config.transport.remotePath,
     retryCount: DEFAULT_TRANSPORT_RETRY_COUNT,
     timeout: DEFAULT_TRANSPORT_TIMEOUT,
     packageSize: -1, // 设置一个无效值或让 scanFiles 处理

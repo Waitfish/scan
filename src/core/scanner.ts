@@ -4,11 +4,12 @@
 
 import * as path from 'path';
 import * as fs from 'fs-extra';
-import * as os from 'os'; // 添加os模块以使用tmpdir
+import * as os from 'os';
 import * as compressing from 'compressing';
 import * as stream from 'stream';
-import { createExtractorFromFile } from 'node-unrar-js'; // 导入 RAR 相关
-import { FileItem, ScanOptions, ScanProgress, FailureItem, ScanResult } from '../types'; // 导入新类型
+import { createExtractorFromFile } from 'node-unrar-js';
+import { FileItem, FailureItem, ScanProgress } from '../types';
+import { ScanOptions, ScanResult } from '../types/scanner'; // 导入新的接口定义
 
 /** 预处理后的匹配规则 */
 interface ProcessedRule {
@@ -16,7 +17,7 @@ interface ProcessedRule {
   nameRegex: RegExp;
 }
 
-// 定义支持扫描的压缩包后缀 (新增 .rar)
+// 定义支持扫描的压缩包后缀
 const ARCHIVE_EXTENSIONS = new Set(['.zip', '.tar', '.tgz', '.tar.gz', '.rar']);
 
 /**
@@ -32,65 +33,31 @@ function isArchiveFile(fileName: string): boolean {
  * @param options 扫描选项
  * @returns 包含成功结果和失败列表的对象
  */
-export async function scanFiles(options: ScanOptions): Promise<ScanResult> { // 更新返回类型
+export async function scanFiles(options: ScanOptions): Promise<ScanResult> {
+  // 记录开始时间
+  const startTime = new Date();
+  
   const {
     rootDir,
     matchRules,
     depth = -1,
-    onProgress,
     maxFileSize = 500 * 1024 * 1024,
     skipDirs = [],
     scanNestedArchives = true,
     maxNestedLevel = 5,
+    taskId,
+    onProgress,
+    onFileMatched,
+    onFailure
   } = options;
 
-  const results: FileItem[] = [];
-  const failures: FailureItem[] = []; // 初始化失败列表
+  // 生成扫描ID (基于时间戳)
+  const scanId = `scan_${startTime.getTime()}`;
+
+  const matchedFiles: FileItem[] = [];
+  const failures: FailureItem[] = [];
   // 记录处理过的压缩文件以避免重复处理
   const processedArchives = new Set<string>();
-
-  // 导入额外的模块和创建额外的结果存储
-  let processedFiles: FileItem[] = [];
-  let packagePaths: string[] = [];
-  let transportResults: any[] = [];
-  
-  // 导入所需模块，确保它们已加载
-  let fileQueue: any = null;
-  let transporter: any = null;
-  
-  // 如果开启了队列处理
-  if (options.queue?.enabled) {
-    try {
-      // 导入文件处理队列模块
-      const { FileProcessingQueue } = require('./queue');
-      fileQueue = new FileProcessingQueue(options.queue, { 
-        maxRetries: options.stabilityCheck?.maxRetries || 3 
-      });
-    } catch (error: any) {
-      console.warn('加载队列模块失败:', error?.message);
-      failures.push({
-        type: 'directoryAccess',
-        path: 'queue.ts',
-        error: `加载队列模块失败: ${error?.message}`
-      });
-    }
-  }
-  
-  // 如果开启了传输功能
-  if (options.transport?.enabled) {
-    try {
-      // 导入文件传输模块
-      const { createTransportAdapter } = require('./transport');
-      transporter = createTransportAdapter(options.transport);
-    } catch (error: any) {
-      console.warn('加载传输模块失败:', error?.message);
-      failures.push({
-        type: 'transport',
-        path: 'transport.ts',
-        error: `加载传输模块失败: ${error?.message}`
-      });
-    }
-  }
 
   const processedRules: ProcessedRule[] = matchRules.map(([extensions, namePattern]) => {
     const normalizedExtensions = extensions.map((ext) =>
@@ -115,19 +82,7 @@ export async function scanFiles(options: ScanOptions): Promise<ScanResult> { // 
     ignoredLargeFiles: 0,
     skippedDirs: 0,
     nestedArchivesScanned: 0,
-    currentNestedLevel: 0,
-    // 添加新的进度属性
-    processedMd5Count: 0,
-    packagedFilesCount: 0,
-    transportedFilesCount: 0,
-    queueStats: fileQueue ? {
-      waiting: 0,
-      processing: 0,
-      completed: 0,
-      failed: 0,
-      retrying: 0,
-      total: 0
-    } : undefined
+    currentNestedLevel: 0
   };
 
   function shouldSkipDirectory(dirPath: string): boolean {
@@ -189,7 +144,7 @@ export async function scanFiles(options: ScanOptions): Promise<ScanResult> { // 
       // 基于文件类型选择合适的处理函数
       if (fileExt === '.rar') {
         // 创建临时文件处理RAR，因为node-unrar-js需要文件路径
-        const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'nested-rar-')); // 修复tmpdir
+        const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'nested-rar-'));
         const tempFile = path.join(tempDir, nestedArchiveName);
         
         try {
@@ -202,14 +157,19 @@ export async function scanFiles(options: ScanOptions): Promise<ScanResult> { // 
             nestedPath
           );
         } catch (error: any) {
-          const message = `[嵌套RAR] 处理嵌套RAR出错: ${error?.message || error}`;
-          console.warn(message);
-          failures.push({ 
+          const failureItem: FailureItem = { 
             type: 'nestedArchive', 
             path: tempFile, 
-            error: message,
+            error: `[嵌套RAR] 处理嵌套RAR出错: ${error?.message || error}`,
             nestedLevel: currentNestedLevel 
-          });
+          };
+          failures.push(failureItem);
+          console.warn(failureItem.error);
+          
+          // 调用失败回调
+          if (onFailure) {
+            onFailure(failureItem, { ...progress });
+          }
         } finally {
           // 清理临时文件
           try {
@@ -235,25 +195,35 @@ export async function scanFiles(options: ScanOptions): Promise<ScanResult> { // 
             nestedPath
           );
         } catch (error: any) {
-          const message = `[嵌套压缩包] 处理嵌套压缩包出错: ${nestedFileName}: ${error?.message || error}`;
-          console.warn(message);
-          failures.push({ 
+          const failureItem: FailureItem = { 
             type: 'nestedArchive', 
             path: nestedFileName, 
-            error: message,
+            error: `[嵌套压缩包] 处理嵌套压缩包出错: ${nestedFileName}: ${error?.message || error}`,
             nestedLevel: currentNestedLevel 
-          });
+          };
+          failures.push(failureItem);
+          console.warn(failureItem.error);
+          
+          // 调用失败回调
+          if (onFailure) {
+            onFailure(failureItem, { ...progress });
+          }
         }
       }
     } catch (error: any) {
-      const message = `[嵌套处理] 流处理错误: ${nestedFileName}: ${error?.message || error}`;
-      console.warn(message);
-      failures.push({ 
+      const failureItem: FailureItem = { 
         type: 'nestedArchive', 
         path: nestedFileName, 
-        error: message,
+        error: `[嵌套处理] 流处理错误: ${nestedFileName}: ${error?.message || error}`,
         nestedLevel: currentNestedLevel 
-      });
+      };
+      failures.push(failureItem);
+      console.warn(failureItem.error);
+      
+      // 调用失败回调
+      if (onFailure) {
+        onFailure(failureItem, { ...progress });
+      }
     }
   }
 
@@ -348,16 +318,35 @@ export async function scanFiles(options: ScanOptions): Promise<ScanResult> { // 
                   nestedLevel: currentNestedLevel,
                   nestedPath: currentNestedPath
                 };
-                results.push(fileItem);
+                matchedFiles.push(fileItem);
                 progress.matchedFiles++;
                 
                 // 更新进度
                 if (onProgress) {
                   progress.currentNestedLevel = currentNestedLevel;
-                  onProgress({ ...progress }, fileItem);
+                  onProgress({ ...progress });
+                }
+                
+                // 调用文件匹配回调
+                if (onFileMatched) {
+                  onFileMatched(fileItem, { ...progress });
                 }
               } else {
                 progress.ignoredLargeFiles++;
+                // 添加被忽略的大文件到失败列表
+                const failureItem: FailureItem = {
+                  type: 'ignoredLargeFile',
+                  path: archiveName,
+                  entryPath: internalPath,
+                  error: `文件大小(${internalSize})超过最大限制(${maxFileSize})`,
+                  nestedLevel: currentNestedLevel
+                };
+                failures.push(failureItem);
+                
+                // 调用失败回调
+                if (onFailure) {
+                  onFailure(failureItem, { ...progress });
+                }
               }
             }
           }
@@ -365,14 +354,21 @@ export async function scanFiles(options: ScanOptions): Promise<ScanResult> { // 
           entryStream.resume();
           next();
         } catch (error: any) {
-          console.warn(`[嵌套扫描] 处理嵌套压缩包内文件出错: ${error?.message || error}`);
-          failures.push({
+          const failureItem: FailureItem = {
             type: 'archiveEntry',
             path: archiveName,
             entryPath: header.name,
-            error: error?.message || String(error),
+            error: `[嵌套扫描] 处理嵌套压缩包内文件出错: ${error?.message || error}`,
             nestedLevel: currentNestedLevel
-          });
+          };
+          failures.push(failureItem);
+          console.warn(failureItem.error);
+          
+          // 调用失败回调
+          if (onFailure) {
+            onFailure(failureItem, { ...progress });
+          }
+          
           entryStream.resume();
           next();
         }
@@ -408,26 +404,36 @@ export async function scanFiles(options: ScanOptions): Promise<ScanResult> { // 
     } else if (ext === '.tar' || isTgz) {
       StreamType = isTgz ? compressing.tgz.UncompressStream : compressing.tar.UncompressStream;
     } else {
-      const message = `[compressing] 不支持的压缩包类型: ${archivePath}`;
-      console.warn(message);
-      failures.push({ 
+      const failureItem: FailureItem = { 
         type: 'archiveOpen', 
         path: archivePath, 
-        error: message,
+        error: `[compressing] 不支持的压缩包类型: ${archivePath}`,
         nestedLevel: currentNestedLevel 
-      });
+      };
+      failures.push(failureItem);
+      console.warn(failureItem.error);
+      
+      // 调用失败回调
+      if (onFailure) {
+        onFailure(failureItem, { ...progress });
+      }
       return;
     }
 
     if (!StreamType) {
-      const message = `[compressing] 无法找到解压流类型: ${ext}`;
-      console.warn(message);
-      failures.push({ 
+      const failureItem: FailureItem = { 
         type: 'archiveOpen', 
         path: archivePath, 
-        error: message,
+        error: `[compressing] 无法找到解压流类型: ${ext}`,
         nestedLevel: currentNestedLevel 
-      });
+      };
+      failures.push(failureItem);
+      console.warn(failureItem.error);
+      
+      // 调用失败回调
+      if (onFailure) {
+        onFailure(failureItem, { ...progress });
+      }
       return;
     }
     
@@ -436,14 +442,20 @@ export async function scanFiles(options: ScanOptions): Promise<ScanResult> { // 
       
       await new Promise<void>((resolve, reject) => {
         stream.on('error', (err: Error) => {
-          const message = `[compressing] 读取压缩包时出错 ${archivePath}: ${err.message}`;
-          console.warn(message);
-          failures.push({ 
+          const failureItem: FailureItem = { 
             type: 'archiveOpen', 
             path: archivePath, 
-            error: err.message,
+            error: `[compressing] 读取压缩包时出错 ${archivePath}: ${err.message}`,
             nestedLevel: currentNestedLevel 
-          });
+          };
+          failures.push(failureItem);
+          console.warn(failureItem.error);
+          
+          // 调用失败回调
+          if (onFailure) {
+            onFailure(failureItem, { ...progress });
+          }
+          
           reject(err);
         });
         stream.on('finish', resolve);
@@ -489,7 +501,10 @@ export async function scanFiles(options: ScanOptions): Promise<ScanResult> { // 
               }
               
               if (isMatch) {
+                // 修复：检查压缩包内文件大小
                 const internalSize = header.size ?? 0; 
+                
+                // 重要修改：只处理满足大小限制的文件
                 if (internalSize <= maxFileSize) {
                   const fileItem: FileItem = {
                     path: archivePath,
@@ -503,32 +518,56 @@ export async function scanFiles(options: ScanOptions): Promise<ScanResult> { // 
                     nestedLevel: currentNestedLevel,
                     nestedPath: currentNestedPath
                   };
-                  results.push(fileItem);
+                  matchedFiles.push(fileItem);
                   progress.matchedFiles++;
                   
                   // 更新进度
                   if (onProgress) {
                     progress.currentNestedLevel = currentNestedLevel;
-                    onProgress({ ...progress }, fileItem);
+                    onProgress({ ...progress });
+                  }
+                  
+                  // 调用文件匹配回调
+                  if (onFileMatched) {
+                    onFileMatched(fileItem, { ...progress });
                   }
                 } else {
                   progress.ignoredLargeFiles++;
+                  // 添加被忽略的大文件到失败列表
+                  const failureItem: FailureItem = {
+                    type: 'ignoredLargeFile',
+                    path: archivePath,
+                    entryPath: internalPath,
+                    error: `文件大小(${internalSize})超过最大限制(${maxFileSize})`,
+                    nestedLevel: currentNestedLevel
+                  };
+                  failures.push(failureItem);
+                  
+                  // 调用失败回调
+                  if (onFailure) {
+                    onFailure(failureItem, { ...progress });
+                  }
                 }
               }
             }
             entryStream.resume(); 
             next();
           } catch (entryError: any) {
-            const message = `[compressing] 处理条目时出错 ${archivePath} > ${header.name}: ${entryError?.message || entryError}`;
-            console.warn(message);
-            // 记录条目处理失败
-            failures.push({
+            const failureItem: FailureItem = {
               type: 'archiveEntry',
               path: archivePath,
               entryPath: header.name,
-              error: entryError?.message || String(entryError),
+              error: `[compressing] 处理条目时出错 ${archivePath} > ${header.name}: ${entryError?.message || entryError}`,
               nestedLevel: currentNestedLevel
-            });
+            };
+            failures.push(failureItem);
+            console.warn(failureItem.error);
+            
+            // 调用失败回调
+            if (onFailure) {
+              onFailure(failureItem, { ...progress });
+            }
+            
             entryStream.resume(); 
             next();
           }
@@ -539,14 +578,19 @@ export async function scanFiles(options: ScanOptions): Promise<ScanResult> { // 
       // 错误已经在 stream.on('error') 中记录到 failures
       // 如果是 new StreamType 的错误，需要在这里记录
       if (!failures.some(f => f.path === archivePath && f.type === 'archiveOpen')) {
-        const message = `[compressing] 无法处理压缩包 ${archivePath}: ${archiveError?.message || archiveError}`;
-        console.warn(message);
-        failures.push({
+        const failureItem: FailureItem = {
           type: 'archiveOpen',
           path: archivePath,
-          error: archiveError?.message || String(archiveError),
+          error: `[compressing] 无法处理压缩包 ${archivePath}: ${archiveError?.message || archiveError}`,
           nestedLevel: currentNestedLevel
-        });
+        };
+        failures.push(failureItem);
+        console.warn(failureItem.error);
+        
+        // 调用失败回调
+        if (onFailure) {
+          onFailure(failureItem, { ...progress });
+        }
       }
     }
   }
@@ -645,15 +689,20 @@ export async function scanFiles(options: ScanOptions): Promise<ScanResult> { // 
                 }
               }
             } catch (nestedError: any) {
-              const message = `[RAR嵌套] 处理嵌套压缩文件出错 ${archivePath} > ${internalName}: ${nestedError?.message || nestedError}`;
-              console.warn(message);
-              failures.push({
+              const failureItem: FailureItem = {
                 type: 'nestedArchive',
                 path: archivePath,
                 entryPath: internalPath,
-                error: nestedError?.message || String(nestedError),
+                error: `[RAR嵌套] 处理嵌套压缩文件出错 ${archivePath} > ${internalName}: ${nestedError?.message || nestedError}`,
                 nestedLevel: currentNestedLevel
-              });
+              };
+              failures.push(failureItem);
+              console.warn(failureItem.error);
+              
+              // 调用失败回调
+              if (onFailure) {
+                onFailure(failureItem, { ...progress });
+              }
             }
             continue; // 已处理嵌套压缩文件，跳过常规处理
           }
@@ -682,43 +731,73 @@ export async function scanFiles(options: ScanOptions): Promise<ScanResult> { // 
                 nestedLevel: currentNestedLevel,
                 nestedPath: currentNestedPath
               };
-              results.push(fileItem);
+              matchedFiles.push(fileItem);
               progress.matchedFiles++;
+              
+              // 更新进度
               if (onProgress) {
                 progress.currentNestedLevel = currentNestedLevel;
-                onProgress({ ...progress }, fileItem);
+                onProgress({ ...progress });
+              }
+              
+              // 调用文件匹配回调
+              if (onFileMatched) {
+                onFileMatched(fileItem, { ...progress });
               }
             } else {
               progress.ignoredLargeFiles++;
+              // 添加被忽略的大文件到失败列表
+              const failureItem: FailureItem = {
+                type: 'ignoredLargeFile',
+                path: archivePath,
+                entryPath: internalPath,
+                error: `文件大小(${internalSize})超过最大限制(${maxFileSize})`,
+                nestedLevel: currentNestedLevel
+              };
+              failures.push(failureItem);
+              
+              // 调用失败回调
+              if (onFailure) {
+                onFailure(failureItem, { ...progress });
+              }
             } 
           }
         } catch (entryError: any) { 
-          const message = `[unrar] 处理条目时出错 ${archivePath} > ${fileHeader?.name}: ${entryError?.message || entryError}`;
-          console.warn(message);
-          failures.push({ 
+          const failureItem: FailureItem = { 
             type: 'archiveEntry', 
             path: archivePath, 
             entryPath: fileHeader?.name, 
-            error: entryError?.message || String(entryError),
+            error: `[unrar] 处理条目时出错 ${archivePath} > ${fileHeader?.name}: ${entryError?.message || entryError}`,
             nestedLevel: currentNestedLevel
-          });
+          };
+          failures.push(failureItem);
+          console.warn(failureItem.error);
+          
+          // 调用失败回调
+          if (onFailure) {
+            onFailure(failureItem, { ...progress });
+          }
           // 继续处理下一个条目
         }
       }
       
     } catch (error: any) {
-      const message = `[unrar] 处理 RAR 压缩包时出错 ${archivePath}: ${error.message || error}`;
-      console.warn(message);
-      failures.push({ 
+      const failureItem: FailureItem = { 
         type: 'rarOpen', 
         path: archivePath, 
-        error: error.message || String(error),
+        error: `[unrar] 处理 RAR 压缩包时出错 ${archivePath}: ${error.message || error}`,
         nestedLevel: currentNestedLevel
-      });
+      };
+      failures.push(failureItem);
+      console.warn(failureItem.error);
+      
+      // 调用失败回调
+      if (onFailure) {
+        onFailure(failureItem, { ...progress });
+      }
     } 
     // 不需要手动关闭 extractor，迭代器完成时资源会自动处理
   }
-
 
   async function scanDirectory(
     currentDir: string,
@@ -751,18 +830,46 @@ export async function scanFiles(options: ScanOptions): Promise<ScanResult> { // 
           
           // 检查是否是支持的压缩包
           if (ARCHIVE_EXTENSIONS.has(fileExt)) {
-             try {
-                const stats = await fs.stat(fullPath);
+            try {
+              const stats = await fs.stat(fullPath);
+              
+              // 检查压缩包大小是否超过限制
+              if (stats.size > maxFileSize) {
+                progress.ignoredLargeFiles++;
+                // 添加被忽略的大压缩包到失败列表
+                const failureItem: FailureItem = {
+                  type: 'ignoredLargeFile',
+                  path: fullPath,
+                  error: `压缩包大小(${stats.size})超过最大限制(${maxFileSize})，跳过检测内部文件`,
+                };
+                failures.push(failureItem);
+                
+                // 调用失败回调
+                if (onFailure) {
+                  onFailure(failureItem, { ...progress });
+                }
+                continue; // 跳过此压缩包的进一步处理
+              } else {
                 // 根据类型调用不同的处理函数
                 if (fileExt === '.rar') {
-                    await scanRarArchive(fullPath, stats.birthtime, stats.mtime);
+                  await scanRarArchive(fullPath, stats.birthtime, stats.mtime);
                 } else {
-                    await scanCompressingArchive(fullPath, stats.birthtime, stats.mtime);
+                  await scanCompressingArchive(fullPath, stats.birthtime, stats.mtime);
                 }
+              }
             } catch (statError: any) {
-              const message = `无法获取压缩包状态: ${fullPath}: ${statError?.message || statError}`;
-              console.warn(message);
-              failures.push({ type: 'fileStat', path: fullPath, error: statError?.message || String(statError) }); // 记录失败
+              const failureItem: FailureItem = { 
+                type: 'fileStat', 
+                path: fullPath, 
+                error: `无法获取压缩包状态: ${fullPath}: ${statError?.message || statError}`
+              };
+              failures.push(failureItem);
+              console.warn(failureItem.error);
+              
+              // 调用失败回调
+              if (onFailure) {
+                onFailure(failureItem, { ...progress });
+              }
             }
             continue; // 跳过后续的常规文件处理
           } else {
@@ -788,340 +895,63 @@ export async function scanFiles(options: ScanOptions): Promise<ScanResult> { // 
                     origin: 'filesystem',
                     nestedLevel: 0, // 文件系统文件，非嵌套
                   };
-                  results.push(fileItem);
+                  matchedFiles.push(fileItem);
                   progress.matchedFiles++;
+                  
+                  // 更新进度
                   if (onProgress) {
-                    onProgress({ ...progress }, fileItem);
+                    onProgress({ ...progress });
+                  }
+                  
+                  // 调用文件匹配回调
+                  if (onFileMatched) {
+                    onFileMatched(fileItem, { ...progress });
                   }
                 } else {
                   progress.ignoredLargeFiles++;
+                  // 添加被忽略的大文件到失败列表
+                  const failureItem: FailureItem = {
+                    type: 'ignoredLargeFile',
+                    path: fullPath,
+                    error: `文件大小(${stats.size})超过最大限制(${maxFileSize})`,
+                  };
+                  failures.push(failureItem);
+                  
+                  // 调用失败回调
+                  if (onFailure) {
+                    onFailure(failureItem, { ...progress });
+                  }
                 }
               } catch (statError: any) {
-                const message = `无法获取文件状态: ${fullPath}: ${statError?.message || statError}`;
-                console.warn(message);
-                failures.push({ type: 'fileStat', path: fullPath, error: statError?.message || String(statError) }); // 记录失败
+                const failureItem: FailureItem = { 
+                  type: 'fileStat', 
+                  path: fullPath, 
+                  error: `无法获取文件状态: ${fullPath}: ${statError?.message || statError}`
+                };
+                failures.push(failureItem);
+                console.warn(failureItem.error);
+                
+                // 调用失败回调
+                if (onFailure) {
+                  onFailure(failureItem, { ...progress });
+                }
               }
             }
           }
         }
       }
     } catch (error: any) {
-      const message = `无法访问目录: ${currentDir}: ${error?.message || error}`;
-      console.warn(message);
-      failures.push({ type: 'directoryAccess', path: currentDir, error: error?.message || String(error) }); // 记录失败
-    }
-  }
-
-  // 在扫描完成后处理队列
-  async function processMatchedFiles(): Promise<void> {
-    // 如果没有启用扩展功能，直接返回
-    if (!fileQueue || !options.queue?.enabled) {
-      return;
-    }
-    
-    // 如果需要检查文件稳定性
-    if (options.stabilityCheck?.enabled) {
-      try {
-        // 导入稳定性检测模块
-        const waitForFileStability = require('./stability').waitForFileStability;
-        
-        // 处理匹配队列中的文件
-        const stableFiles: FileItem[] = [];
-        const unstableFiles: FileItem[] = [];
-        
-        // 从队列中处理文件批次
-        fileQueue.processNextBatch('matched', options.queue.maxConcurrentChecks, async (batchFiles: FileItem[]) => {
-          for (const file of batchFiles) {
-            try {
-              const isStable = await waitForFileStability(file.path, options.stabilityCheck);
-              
-              if (isStable) {
-                stableFiles.push(file);
-                if (options.calculateMd5) {
-                  fileQueue.addToQueue('md5', file);
-                } else {
-                  fileQueue.addToQueue('packaging', file);
-                }
-              } else {
-                unstableFiles.push(file);
-                fileQueue.addToRetryQueue(file, 'stability');
-                failures.push({
-                  type: 'stability',
-                  path: file.path,
-                  error: '文件不稳定，添加到重试队列'
-                });
-              }
-            } catch (error: any) {
-              failures.push({
-                type: 'stability',
-                path: file.path,
-                error: `稳定性检测失败: ${error?.message}`
-              });
-              unstableFiles.push(file);
-              fileQueue.addToRetryQueue(file, 'stability');
-            }
-          }
-        });
-        
-        // 处理重试队列
-        fileQueue.processRetryQueue(async (retryFiles: FileItem[], queueType: string) => {
-          if (queueType === 'stability') {
-            for (const file of retryFiles) {
-              try {
-                const isStable = await waitForFileStability(file.path, options.stabilityCheck);
-                
-                if (isStable) {
-                  stableFiles.push(file);
-                  if (options.calculateMd5) {
-                    fileQueue.addToQueue('md5', file);
-                  } else {
-                    fileQueue.addToQueue('packaging', file);
-                  }
-                } else {
-                  unstableFiles.push(file);
-                  fileQueue.markAsFailed(file.path);
-                  failures.push({
-                    type: 'stability',
-                    path: file.path,
-                    error: '多次尝试后文件仍不稳定'
-                  });
-                }
-              } catch (error: any) {
-                failures.push({
-                  type: 'stability',
-                  path: file.path,
-                  error: `重试稳定性检测失败: ${error?.message}`
-                });
-                fileQueue.markAsFailed(file.path);
-              }
-            }
-          }
-        });
-        
-        // 更新进度信息
-        if (onProgress && fileQueue) {
-          const queueStats = fileQueue.getQueueStats();
-          if (queueStats) {
-            progress.queueStats = queueStats;
-            onProgress(progress);
-          }
-        }
-      } catch (error: any) {
-        console.warn('执行稳定性检测失败:', error?.message);
-        failures.push({
-          type: 'stability',
-          path: 'stability.ts',
-          error: `执行稳定性检测失败: ${error?.message}`
-        });
-      }
-    }
-    
-    // 如果需要计算MD5
-    if (options.calculateMd5) {
-      try {
-        // 导入MD5计算模块
-        const calculateBatchMd5 = require('./md5').calculateBatchMd5;
-        
-        // 处理MD5队列中的文件
-        const filesWithMd5: FileItem[] = [];
-        
-        fileQueue.processNextBatch('md5', options.queue.maxConcurrentChecks, async (mdFiles: FileItem[]) => {
-          try {
-            const md5ProcessedFiles = await calculateBatchMd5(mdFiles, {
-              onProgress: (_progress: number, _filePath: string) => {
-                if (onProgress) {
-                  progress.processedMd5Count = (progress.processedMd5Count || 0) + 1;
-                  onProgress(progress);
-                }
-              }
-            });
-            
-            md5ProcessedFiles.forEach((processedFile: FileItem) => {
-              filesWithMd5.push(processedFile);
-              if (options.createPackage) {
-                fileQueue.addToQueue('packaging', processedFile);
-              }
-            });
-          } catch (error: any) {
-            console.error('批量计算MD5失败:', error?.message);
-            mdFiles.forEach((failedFile: FileItem) => {
-              fileQueue.markAsFailed(failedFile.path);
-              failures.push({
-                type: 'md5',
-                path: failedFile.path,
-                error: `MD5计算失败: ${error?.message}`
-              });
-            });
-          }
-        });
-        
-        // 保存处理后的文件
-        processedFiles = filesWithMd5;
-        
-        // 更新进度信息
-        if (onProgress && fileQueue) {
-          const queueStats = fileQueue.getQueueStats();
-          if (queueStats) {
-            progress.queueStats = queueStats;
-            onProgress(progress);
-          }
-        }
-      } catch (error: any) {
-        console.warn('执行MD5计算失败:', error?.message);
-        failures.push({
-          type: 'md5',
-          path: 'md5.ts',
-          error: `执行MD5计算失败: ${error?.message}`
-        });
-      }
-    }
-    
-    // 如果需要创建打包
-    if (options.createPackage) {
-      try {
-        // 导入打包模块
-        const createBatchPackage = require('./packaging').createBatchPackage;
-        
-        // 准备打包目录
-        const tempDir = path.join(process.cwd(), 'temp');
-        await fs.ensureDir(tempDir);
-        
-        // 处理打包队列中的文件
-        const filesToPackage = fileQueue.getFilesInQueue('packaging');
-        
-        if (filesToPackage && filesToPackage.length > 0) {
-          // 生成包名
-          const date = new Date().toISOString().split('T')[0];
-          const packageName = (options.packageNamePattern || 'package_{date}_{index}')
-            .replace('{date}', date)
-            .replace('{index}', '1');
-          
-          const outputPackagePath = path.join(tempDir, `${packageName}.zip`);
-          
-          try {
-            const packagingResult = await createBatchPackage(filesToPackage, outputPackagePath, {
-              includeMd5: true,
-              includeMetadata: true,
-              onProgress: (_packProgress: any) => {
-                if (onProgress) {
-                  progress.packagedFilesCount = _packProgress.processedFiles;
-                  onProgress(progress);
-                }
-              }
-            });
-            
-            if (packagingResult.success) {
-              packagePaths.push(outputPackagePath);
-              
-              // 如果需要传输，将包添加到传输队列
-              if (options.transport?.enabled && transporter) {
-                fileQueue.addToQueue('transport', {
-                  path: outputPackagePath,
-                  name: path.basename(outputPackagePath),
-                  createTime: new Date(),
-                  modifyTime: new Date(),
-                  size: (await fs.stat(outputPackagePath)).size
-                });
-              }
-            } else {
-              failures.push({
-                type: 'packaging',
-                path: 'package',
-                error: `打包失败: ${packagingResult.error?.message}`
-              });
-            }
-          } catch (error: any) {
-            failures.push({
-              type: 'packaging',
-              path: 'package',
-              error: `打包过程发生错误: ${error?.message}`
-            });
-          }
-        }
-        
-        // 更新进度信息
-        if (onProgress && fileQueue) {
-          const queueStats = fileQueue.getQueueStats();
-          if (queueStats) {
-            progress.queueStats = queueStats;
-            onProgress(progress);
-          }
-        }
-      } catch (error: any) {
-        console.warn('执行打包失败:', error?.message);
-        failures.push({
-          type: 'packaging',
-          path: 'packaging.ts',
-          error: `执行打包失败: ${error?.message}`
-        });
-      }
-    }
-    
-    // 如果需要传输文件
-    if (options.transport?.enabled && transporter) {
-      try {
-        // 连接到服务器
-        await transporter.connect();
-        
-        // 处理传输队列中的文件
-        const filesToTransport = fileQueue.getFilesInQueue('transport');
-        
-        if (filesToTransport && filesToTransport.length > 0) {
-          for (const file of filesToTransport) {
-            try {
-              // 上传文件
-              const uploadResult = await transporter.upload(
-                file.path,
-                path.basename(file.path)
-              );
-              
-              transportResults.push(uploadResult);
-              
-              if (uploadResult.success) {
-                fileQueue.markAsCompleted(file.path);
-              } else {
-                fileQueue.markAsFailed(file.path);
-                failures.push({
-                  type: 'transport',
-                  path: file.path,
-                  error: `传输失败: ${uploadResult.error}`
-                });
-              }
-              
-              // 更新传输进度
-              if (onProgress) {
-                progress.transportedFilesCount = (progress.transportedFilesCount || 0) + 1;
-                onProgress(progress);
-              }
-            } catch (error: any) {
-              fileQueue.markAsFailed(file.path);
-              failures.push({
-                type: 'transport',
-                path: file.path,
-                error: `传输过程发生错误: ${error?.message}`
-              });
-            }
-          }
-        }
-        
-        // 断开连接
-        await transporter.disconnect();
-        
-        // 更新进度信息
-        if (onProgress && fileQueue) {
-          const queueStats = fileQueue.getQueueStats();
-          if (queueStats) {
-            progress.queueStats = queueStats;
-            onProgress(progress);
-          }
-        }
-      } catch (error: any) {
-        console.warn('执行传输失败:', error?.message);
-        failures.push({
-          type: 'transport',
-          path: 'transport.ts',
-          error: `执行传输失败: ${error?.message}`
-        });
+      const failureItem: FailureItem = { 
+        type: 'directoryAccess', 
+        path: currentDir, 
+        error: `无法访问目录: ${currentDir}: ${error?.message || error}`
+      };
+      failures.push(failureItem);
+      console.warn(failureItem.error);
+      
+      // 调用失败回调
+      if (onFailure) {
+        onFailure(failureItem, { ...progress });
       }
     }
   }
@@ -1129,24 +959,39 @@ export async function scanFiles(options: ScanOptions): Promise<ScanResult> { // 
   try {
     // 扫描根目录
     await scanDirectory(rootDir, 0);
-    
-    // 处理匹配的文件（稳定性检测、MD5计算、打包和传输）
-    if (options.queue?.enabled) {
-      await processMatchedFiles();
-    }
   } catch (error: any) {
-    failures.push({
-      type: 'directoryAccess',
+    const failureItem: FailureItem = {
+      type: 'scanError',
       path: rootDir,
       error: error?.message || 'Unknown error',
-    });
+    };
+    failures.push(failureItem);
+    
+    // 调用失败回调
+    if (onFailure) {
+      onFailure(failureItem, { ...progress });
+    }
   }
 
+  // 记录结束时间
+  const endTime = new Date();
+  const elapsedTimeMs = endTime.getTime() - startTime.getTime();
+
+  // 返回扫描结果
   return {
-    results,
+    matchedFiles,
     failures,
-    processedFiles: processedFiles.length > 0 ? processedFiles : undefined,
-    packages: packagePaths.length > 0 ? packagePaths : undefined,
-    transportResults: transportResults.length > 0 ? transportResults : undefined
+    stats: {
+      totalScanned: progress.scannedFiles,
+      totalMatched: progress.matchedFiles,
+      totalFailures: failures.length,
+      archivesScanned: progress.archivesScanned,
+      nestedArchivesScanned: progress.nestedArchivesScanned || 0
+    },
+    taskId,
+    scanId,
+    startTime,
+    endTime,
+    elapsedTimeMs
   };
 } 

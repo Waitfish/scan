@@ -357,13 +357,13 @@ describe('嵌套压缩文件扫描测试', () => {
     };
     
     // 执行扫描
-    const { results, failures } = await scanFiles(scanOptions);
+    const { matchedFiles, failures } = await scanFiles(scanOptions);
     
     // 验证结果
     expect(failures.length).toBe(0);
 
     // 找到嵌套级别=1的docx文件
-    const level1DocxFiles = results.filter(file => 
+    const level1DocxFiles = matchedFiles.filter(file => 
       file.name.endsWith('.docx') && 
       file.nestedLevel === 1 && 
       file.origin === 'archive'
@@ -406,13 +406,13 @@ describe('嵌套压缩文件扫描测试', () => {
     };
     
     // 执行扫描
-    const { results, failures } = await scanFiles(scanOptions);
+    const { matchedFiles, failures } = await scanFiles(scanOptions);
     
     // 验证结果
     expect(failures.length).toBe(0);
 
     // 找到独立提取的docx文件 (nestedLevel=0, origin=archive)
-    const standaloneFiles = results.filter(file => 
+    const standaloneFiles = matchedFiles.filter(file => 
       file.name.endsWith('.docx') && 
       file.nestedLevel === 0 && 
       file.origin === 'archive'
@@ -442,10 +442,10 @@ describe('嵌套压缩文件扫描测试', () => {
     };
     
     // 执行扫描
-    const { results } = await scanFiles(scanOptions);
+    const { matchedFiles } = await scanFiles(scanOptions);
     
     // 验证结果
-    const docxFiles = results.filter(file => 
+    const docxFiles = matchedFiles.filter(file => 
       file.name.endsWith('.docx') && 
       file.nestedLevel === 4 &&
       file.origin === 'archive'
@@ -474,10 +474,10 @@ describe('嵌套压缩文件扫描测试', () => {
     };
     
     // 执行扫描
-    const { results } = await scanFiles(scanOptions);
+    const { matchedFiles } = await scanFiles(scanOptions);
     
     // 验证结果 - 不应该找到第6层的文件
-    const docxFiles = results.filter(file => 
+    const docxFiles = matchedFiles.filter(file => 
       file.name.endsWith('.docx') && 
       file.nestedLevel === 6 &&
       file.origin === 'archive'
@@ -503,10 +503,10 @@ describe('嵌套压缩文件扫描测试', () => {
     };
     
     // 执行扫描
-    const { results } = await scanFiles(scanOptions);
+    const { matchedFiles } = await scanFiles(scanOptions);
     
     // 验证结果 - 不应该找到内部压缩文件中的匹配文件
-    const nestedDocxFiles = results.filter(file => 
+    const nestedDocxFiles = matchedFiles.filter(file => 
       file.name.endsWith('.docx') && 
       file.origin === 'archive' &&
       file.nestedLevel === 1
@@ -532,10 +532,10 @@ describe('嵌套压缩文件扫描测试', () => {
     };
     
     // 执行扫描
-    const { results } = await scanFiles(scanOptions);
+    const { matchedFiles } = await scanFiles(scanOptions);
     
     // 验证结果
-    const docxFiles = results.filter(file => 
+    const docxFiles = matchedFiles.filter(file => 
       file.name.endsWith('.docx') && 
       file.nestedLevel === 2 &&
       file.origin === 'archive'
@@ -572,11 +572,11 @@ describe('嵌套压缩文件扫描测试', () => {
     };
     
     // 执行扫描
-    const { results, failures } = await scanFiles(scanOptions);
+    const { matchedFiles, failures } = await scanFiles(scanOptions);
     
     // 验证结果
     // 应该找到两个文件：一个在ZIP根目录，一个在RAR文件中
-    const docxFiles = results.filter(file => 
+    const docxFiles = matchedFiles.filter(file => 
       file.name.endsWith('.docx') && 
       file.origin === 'archive'
     );
@@ -640,10 +640,10 @@ describe('嵌套压缩文件扫描测试', () => {
     };
     
     // 执行扫描
-    const { results, failures } = await scanFiles(scanOptions);
+    const { matchedFiles, failures } = await scanFiles(scanOptions);
     
     // 验证结果
-    const docxFiles = results.filter(file => 
+    const docxFiles = matchedFiles.filter(file => 
       file.name.endsWith('.docx') && 
       file.origin === 'archive'
     );
@@ -693,10 +693,10 @@ describe('嵌套压缩文件扫描测试', () => {
     };
     
     // 执行扫描
-    const { results, failures } = await scanFiles(scanOptions);
+    const { matchedFiles, failures } = await scanFiles(scanOptions);
     
     // 验证结果
-    const docxFiles = results.filter(file => 
+    const docxFiles = matchedFiles.filter(file => 
       file.name.endsWith('.docx') && 
       file.origin === 'archive'
     );

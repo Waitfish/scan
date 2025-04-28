@@ -1,19 +1,17 @@
+/**
+ * @file 外观模式接口定义 (重构版)
+ */
+
 import { FileItem, MatchRule, ScanProgress, FailureItem, TransportOptions as CoreTransportOptions } from './index';
 import { QueueConfig, StabilityConfig } from './queue';
 
-/**
- * 定义简化版的 Transport 配置接口 (仅移除 retryCount, timeout, debug, packageSize)
- * @deprecated 将在重构后删除，请使用 facade-v2.ts 中的接口
- */
+/** 定义简化版的 Transport 配置接口 (仅移除 retryCount, timeout, debug, packageSize) */
 export type ScanAndTransportTransportConfig = Omit<CoreTransportOptions, 'retryCount' | 'timeout' | 'debug' | 'packageSize'> & {
     /** 是否启用传输 (可选，默认 true) */
     enabled?: boolean;
 };
 
-/**
- * 定义打包触发条件接口
- * @deprecated 将在重构后删除，请使用 facade-v2.ts 中的接口
- */
+/** 定义打包触发条件接口 */
 export interface PackagingTriggerOptions {
   /** 触发打包的文件数量阈值 */
   maxFiles: number;
@@ -21,10 +19,7 @@ export interface PackagingTriggerOptions {
   maxSizeMB: number;
 }
 
-/**
- * 定义 scanAndTransport 配置接口
- * @deprecated 将在重构后删除，请使用 facade-v2.ts 中的接口
- */
+/** 定义 scanAndTransport 配置接口 */
 export interface ScanAndTransportConfig {
   // --- 必需参数 ---
   /** 要扫描的根目录 */
@@ -58,7 +53,6 @@ export interface ScanAndTransportConfig {
   /** 日志文件路径 (默认: './scan_transport_log_{时间戳}.log') */
   logFilePath?: string;
   
-  // --- 新增参数 ---
   /** 队列处理配置 */
   queue?: QueueConfig;
   /** 稳定性检测配置 */
@@ -69,10 +63,7 @@ export interface ScanAndTransportConfig {
   resultsDir?: string;
 }
 
-/**
- * 定义 scanAndTransport 返回结果接口
- * @deprecated 将在重构后删除，请使用 facade-v2.ts 中的接口
- */
+/** 定义 scanAndTransport 返回结果接口 */
 export interface ScanAndTransportResult {
   /** 整个过程是否基本成功 (即使有部分文件失败) */
   success: boolean;
