@@ -3,10 +3,8 @@
  * 用于处理扫描过程中的文件队列，包括匹配队列、稳定性检测队列、MD5计算队列、打包队列和传输队列
  */
 
-import { FileItem, QueueOptions } from '../types';
-
-// 队列类型
-export type QueueType = 'matched' | 'stability' | 'md5' | 'packaging' | 'transport';
+import { FileItem, FailureItem } from '../types';
+import { QueueConfig, QueueType, StabilityConfig, ArchiveTracker, QueueStats } from '../types/queue';
 
 // 重试队列项
 interface RetryQueueItem {
@@ -14,11 +12,6 @@ interface RetryQueueItem {
   attempts: number;
   lastAttempt: number;
   targetQueue: QueueType;
-}
-
-// 队列配置选项
-interface QueueConfigOptions {
-  maxRetries?: number;
 }
 
 /**
@@ -63,11 +56,12 @@ export interface QueueItem {
  */
 export class FileProcessingQueue {
   // 各阶段队列
-  private matchedQueue: FileItem[] = [];        // 扫描匹配的文件
-  private stabilityQueue: FileItem[] = [];      // 等待稳定性检测的文件
-  private md5Queue: FileItem[] = [];            // 等待MD5计算的文件
-  private packagingQueue: FileItem[] = [];      // 等待打包的文件
-  private transportQueue: FileItem[] = [];      // 等待传输的文件
+  private matchedQueue: FileItem[] = [];               // 扫描匹配的文件
+  private fileStabilityQueue: FileItem[] = [];         // 等待文件稳定性检测的文件
+  private archiveStabilityQueue: FileItem[] = [];      // 等待压缩包稳定性检测的文件
+  private md5Queue: FileItem[] = [];                   // 等待MD5计算的文件
+  private packagingQueue: FileItem[] = [];             // 等待打包的文件
+  private transportQueue: FileItem[] = [];             // 等待传输的文件
   
   // 特殊队列
   private retryQueue: Map<string, RetryQueueItem> = new Map(); // 重试队列
@@ -80,25 +74,61 @@ export class FileProcessingQueue {
   // 处理中的文件数量
   private processing: Map<QueueType, Set<string>> = new Map();
   
+  // 压缩包追踪器
+  private archiveTracker: ArchiveTracker = {
+    archiveToFiles: new Map<string, Set<FileItem>>(),
+    isQueued: new Map<string, boolean>(),
+    status: new Map<string, 'waiting' | 'processing' | 'stable' | 'unstable' | 'failed'>()
+  };
+  
   // 配置
-  private options: QueueOptions;
-  private config: QueueConfigOptions;
+  private queueConfig: QueueConfig;
+  private stabilityConfig: StabilityConfig;
   
   /**
    * 构造函数
-   * @param options 队列选项
-   * @param config 队列配置
+   * @param queueConfig 队列配置
+   * @param stabilityConfig 稳定性检测配置
    */
-  constructor(options: QueueOptions, config: QueueConfigOptions = {}) {
-    this.options = options;
-    this.config = {
-      maxRetries: 3,
-      ...config
+  constructor(queueConfig: QueueConfig, stabilityConfig: StabilityConfig = {}) {
+    this.queueConfig = {
+      enabled: true,
+      maxConcurrentFileChecks: 5,
+      maxConcurrentArchiveChecks: 3,
+      maxConcurrentMd5: 5,
+      maxConcurrentTransfers: 2,
+      stabilityRetryDelay: 2000,
+      maxStabilityRetries: 3,
+      ...queueConfig
+    };
+    
+    this.stabilityConfig = {
+      base: {
+        enabled: true,
+        checkInterval: 500,
+        maxRetries: 3,
+        ...stabilityConfig.base
+      },
+      file: {
+        enabled: true,
+        checkInterval: 500,
+        maxRetries: 3,
+        largeFileThreshold: 100 * 1024 * 1024, // 100MB
+        skipReadForLargeFiles: true,
+        ...stabilityConfig.file
+      },
+      archive: {
+        enabled: true,
+        checkInterval: 1000,
+        maxRetries: 3,
+        keepTempFiles: false,
+        ...stabilityConfig.archive
+      }
     };
     
     // 初始化处理中集合
-    this.processing.set('matched', new Set());
-    this.processing.set('stability', new Set());
+    this.processing.set('fileStability', new Set());
+    this.processing.set('archiveStability', new Set());
     this.processing.set('md5', new Set());
     this.processing.set('packaging', new Set());
     this.processing.set('transport', new Set());
@@ -111,6 +141,98 @@ export class FileProcessingQueue {
   public addToMatchedQueue(file: FileItem): void {
     this.matchedQueue.push(file);
     this.pathMap.set(file.path, file);
+    
+    // 如果是压缩包内的文件，添加到压缩包追踪器
+    if (file.origin === 'archive' && file.archivePath) {
+      this.trackArchiveFile(file);
+    }
+  }
+  
+  /**
+   * 追踪压缩包内文件
+   * @param file 压缩包内文件
+   */
+  private trackArchiveFile(file: FileItem): void {
+    if (!file.archivePath) return;
+    
+    // 获取或创建此压缩包关联的文件集合
+    if (!this.archiveTracker.archiveToFiles.has(file.archivePath)) {
+      this.archiveTracker.archiveToFiles.set(file.archivePath, new Set());
+      this.archiveTracker.status.set(file.archivePath, 'waiting');
+      this.archiveTracker.isQueued.set(file.archivePath, false);
+    }
+    
+    // 将文件添加到压缩包关联集合
+    this.archiveTracker.archiveToFiles.get(file.archivePath)!.add(file);
+  }
+  
+  /**
+   * 处理匹配队列，根据文件来源将文件分配到对应队列
+   */
+  public processMatchedQueue(): void {
+    // 处理普通文件
+    const regularFiles = this.matchedQueue.filter(file => 
+      file.origin !== 'archive' || !file.archivePath
+    );
+    
+    // 将普通文件添加到文件稳定性队列
+    regularFiles.forEach(file => {
+      this.fileStabilityQueue.push(file);
+    });
+    
+    // 处理压缩包文件
+    const archiveFiles = this.matchedQueue.filter(file => 
+      file.origin === 'archive' && file.archivePath
+    );
+    
+    // 将压缩包文件添加到压缩包追踪器
+    archiveFiles.forEach(file => {
+      this.trackArchiveFile(file);
+    });
+    
+    // 将需要检测稳定性的压缩包添加到队列
+    for (const [archivePath, isQueued] of this.archiveTracker.isQueued.entries()) {
+      if (!isQueued && this.archiveTracker.status.get(archivePath) === 'waiting') {
+        // 创建一个代表整个压缩包的FileItem
+        const archiveStats = this.getArchiveStats(archivePath);
+        if (archiveStats) {
+          const archiveItem: FileItem = {
+            path: archivePath,
+            name: archivePath.split('/').pop() || '',
+            createTime: archiveStats.createTime,
+            modifyTime: archiveStats.modifyTime,
+            size: archiveStats.size,
+            origin: 'filesystem',
+            nestedLevel: 0
+          };
+          
+          // 添加到压缩包稳定性队列
+          this.archiveStabilityQueue.push(archiveItem);
+          this.archiveTracker.isQueued.set(archivePath, true);
+        }
+      }
+    }
+    
+    // 清空匹配队列
+    this.matchedQueue = [];
+  }
+  
+  /**
+   * 获取压缩包统计信息
+   * @param archivePath 压缩包路径
+   * @returns 压缩包文件统计信息
+   */
+  private getArchiveStats(archivePath: string): { createTime: Date, modifyTime: Date, size: number } | null {
+    const filesInArchive = this.archiveTracker.archiveToFiles.get(archivePath);
+    if (!filesInArchive || filesInArchive.size === 0) return null;
+    
+    // 使用第一个文件的时间戳和大小
+    const firstFile = Array.from(filesInArchive)[0];
+    return {
+      createTime: firstFile.createTime,
+      modifyTime: firstFile.modifyTime,
+      size: firstFile.size
+    };
   }
   
   /**
@@ -120,11 +242,11 @@ export class FileProcessingQueue {
    */
   public addToQueue(queueType: QueueType, file: FileItem): void {
     switch (queueType) {
-      case 'matched':
-        this.matchedQueue.push(file);
+      case 'fileStability':
+        this.fileStabilityQueue.push(file);
         break;
-      case 'stability':
-        this.stabilityQueue.push(file);
+      case 'archiveStability':
+        this.archiveStabilityQueue.push(file);
         break;
       case 'md5':
         this.md5Queue.push(file);
@@ -144,23 +266,129 @@ export class FileProcessingQueue {
   }
   
   /**
+   * 文件稳定性检测成功后，将关联的压缩包内文件添加到MD5队列
+   * @param archivePath 压缩包路径
+   */
+  public processStableArchive(archivePath: string): void {
+    // 标记压缩包为稳定
+    this.archiveTracker.status.set(archivePath, 'stable');
+    
+    // 获取此压缩包内的所有文件
+    const filesInArchive = this.archiveTracker.archiveToFiles.get(archivePath);
+    if (!filesInArchive) return;
+    
+    // 将所有文件添加到MD5队列
+    filesInArchive.forEach(file => {
+      this.md5Queue.push(file);
+    });
+  }
+  
+  /**
+   * 压缩包稳定性检测失败，将关联的文件标记为失败
+   * @param archivePath 压缩包路径
+   * @param error 错误信息
+   */
+  public processUnstableArchive(archivePath: string, error: string): void {
+    // 标记压缩包为不稳定
+    this.archiveTracker.status.set(archivePath, 'unstable');
+    
+    // 获取此压缩包内的所有文件
+    const filesInArchive = this.archiveTracker.archiveToFiles.get(archivePath);
+    if (!filesInArchive) return;
+    
+    // 为所有文件创建失败项
+    const failureItem: FailureItem = {
+      type: 'archiveStability',
+      path: archivePath,
+      error: `压缩包不稳定: ${error}`,
+      affectedFiles: Array.from(filesInArchive).map(f => f.path)
+    };
+    
+    // 将所有文件标记为失败
+    filesInArchive.forEach(file => {
+      this.markAsFailed(file.path, failureItem);
+    });
+  }
+  
+  /**
    * 将文件添加到重试队列
    * @param file 文件项
    * @param targetQueue 目标队列类型
    */
   public addToRetryQueue(file: FileItem, targetQueue: QueueType): void {
-    const retryItem = this.retryQueue.get(file.path) || {
+    const existingItem = this.retryQueue.get(file.path);
+    
+    const retryItem: RetryQueueItem = existingItem ? {
+      ...existingItem,
+      attempts: existingItem.attempts + 1,
+      lastAttempt: Date.now()
+    } : {
       file,
-      attempts: 0,
+      attempts: 1,
       lastAttempt: Date.now(),
       targetQueue
     };
     
-    this.retryQueue.set(file.path, retryItem);
+    // 检查是否超过最大重试次数
+    const maxRetries = this.getMaxRetriesForQueue(targetQueue);
     
-    // 确保文件在路径映射中
-    if (!this.pathMap.has(file.path)) {
-      this.pathMap.set(file.path, file);
+    if (retryItem.attempts > maxRetries) {
+      // 超过最大重试次数，标记为失败
+      const failureItem: FailureItem = {
+        type: this.getFailureTypeForQueue(targetQueue),
+        path: file.path,
+        error: `超过最大重试次数(${maxRetries})，停止重试`
+      };
+      
+      if (file.origin === 'archive' && file.archivePath) {
+        failureItem.entryPath = file.internalPath;
+      }
+      
+      this.markAsFailed(file.path, failureItem);
+    } else {
+      // 未超过最大重试次数，添加到重试队列
+      this.retryQueue.set(file.path, retryItem);
+      
+      // 确保文件在路径映射中
+      if (!this.pathMap.has(file.path)) {
+        this.pathMap.set(file.path, file);
+      }
+    }
+  }
+  
+  /**
+   * 根据队列类型获取对应的最大重试次数
+   * @param queueType 队列类型
+   */
+  private getMaxRetriesForQueue(queueType: QueueType): number {
+    switch (queueType) {
+      case 'fileStability':
+        return this.stabilityConfig.file?.maxRetries || 3;
+      case 'archiveStability':
+        return this.stabilityConfig.archive?.maxRetries || 3;
+      default:
+        return this.queueConfig.maxStabilityRetries || 3;
+    }
+  }
+  
+  /**
+   * 根据队列类型获取对应的失败类型
+   * @param queueType 队列类型
+   */
+  private getFailureTypeForQueue(queueType: QueueType): FailureItem['type'] {
+    switch (queueType) {
+      case 'fileStability':
+        return 'stability';
+      case 'archiveStability':
+        return 'archiveStability';
+      case 'md5':
+        return 'md5';
+      case 'packaging':
+        return 'packaging';
+      case 'transport':
+        return 'transport';
+      default:
+        return 'scanError';
     }
   }
   
@@ -186,11 +414,11 @@ export class FileProcessingQueue {
     let queue: FileItem[] = [];
     
     switch (queueType) {
-      case 'matched':
-        queue = this.matchedQueue;
+      case 'fileStability':
+        queue = this.fileStabilityQueue;
         break;
-      case 'stability':
-        queue = this.stabilityQueue;
+      case 'archiveStability':
+        queue = this.archiveStabilityQueue;
         break;
       case 'md5':
         queue = this.md5Queue;
@@ -223,8 +451,8 @@ export class FileProcessingQueue {
     const file = this.pathMap.get(filePath);
     if (file) {
       // 从所有队列移除
-      this.removeFromQueue('matched', filePath);
-      this.removeFromQueue('stability', filePath);
+      this.removeFromQueue('fileStability', filePath);
+      this.removeFromQueue('archiveStability', filePath);
       this.removeFromQueue('md5', filePath);
       this.removeFromQueue('packaging', filePath);
       this.removeFromQueue('transport', filePath);
@@ -240,13 +468,14 @@ export class FileProcessingQueue {
   /**
    * 标记文件为失败状态
    * @param filePath 文件路径
+   * @param failureItem 可选的失败信息
    */
-  public markAsFailed(filePath: string): void {
+  public markAsFailed(filePath: string, failureItem?: FailureItem): void {
     const file = this.pathMap.get(filePath);
     if (file) {
       // 从所有队列移除
-      this.removeFromQueue('matched', filePath);
-      this.removeFromQueue('stability', filePath);
+      this.removeFromQueue('fileStability', filePath);
+      this.removeFromQueue('archiveStability', filePath);
       this.removeFromQueue('md5', filePath);
       this.removeFromQueue('packaging', filePath);
       this.removeFromQueue('transport', filePath);
@@ -256,6 +485,11 @@ export class FileProcessingQueue {
       
       // 添加到失败集合
       this.failedFiles.set(filePath, file);
+      
+      // 如果是压缩包，更新压缩包状态
+      if (failureItem && failureItem.type === 'archiveStability' && file.origin === 'filesystem') {
+        this.archiveTracker.status.set(filePath, 'failed');
+      }
     }
   }
   
@@ -274,35 +508,50 @@ export class FileProcessingQueue {
     
     // 根据目标队列确定源队列
     switch (targetQueue) {
-      case 'stability':
-        sourceQueue = this.matchedQueue;
+      case 'fileStability':
+        // 源队列是已处理的匹配队列
+        this.processMatchedQueue();
+        sourceQueue = this.fileStabilityQueue;
+        break;
+      case 'archiveStability':
+        // 源队列是已处理的匹配队列
+        this.processMatchedQueue();
+        sourceQueue = this.archiveStabilityQueue;
         break;
       case 'md5':
-        sourceQueue = this.stabilityQueue;
-        break;
-      case 'packaging':
+        // 源队列是已经稳定的文件
         sourceQueue = this.md5Queue;
         break;
-      case 'transport':
+      case 'packaging':
+        // 源队列是已经计算MD5的文件
         sourceQueue = this.packagingQueue;
         break;
-      case 'matched':
-        // 匹配队列是初始队列，没有源队列
-        return;
+      case 'transport':
+        // 源队列是已经打包的文件
+        sourceQueue = this.transportQueue;
+        break;
     }
     
+    // 调整批处理大小，确保不超过配置的并发数
+    const maxConcurrent = this.getMaxConcurrentForQueue(targetQueue);
+    const processingSet = this.processing.get(targetQueue) || new Set();
+    const availableSlots = Math.max(0, maxConcurrent - processingSet.size);
+    const actualBatchSize = Math.min(batchSize, availableSlots);
+    
     // 不能超过批处理大小
-    const batch = sourceQueue.slice(0, batchSize);
+    const batch = sourceQueue.slice(0, actualBatchSize);
     if (batch.length === 0) return;
     
     // 从源队列移除
-    sourceQueue.splice(0, batch.length);
-    
-    // 添加到目标队列
     batch.forEach(file => {
-      this.addToQueue(targetQueue, file);
-      
-      // 标记为处理中
+      const index = sourceQueue.findIndex(item => item.path === file.path);
+      if (index !== -1) {
+        sourceQueue.splice(index, 1);
+      }
+    });
+    
+    // 标记为处理中
+    batch.forEach(file => {
       const processingSet = this.processing.get(targetQueue);
       if (processingSet) {
         processingSet.add(file.path);
@@ -311,6 +560,25 @@ export class FileProcessingQueue {
     
     // 调用处理函数
     processor(batch);
+  }
+  
+  /**
+   * 获取队列的最大并发数
+   * @param queueType 队列类型
+   */
+  private getMaxConcurrentForQueue(queueType: QueueType): number {
+    switch (queueType) {
+      case 'fileStability':
+        return this.queueConfig.maxConcurrentFileChecks || 5;
+      case 'archiveStability':
+        return this.queueConfig.maxConcurrentArchiveChecks || 3;
+      case 'md5':
+        return this.queueConfig.maxConcurrentMd5 || 5;
+      case 'transport':
+        return this.queueConfig.maxConcurrentTransfers || 2;
+      default:
+        return 5; // 默认值
+    }
   }
   
   /**
@@ -327,21 +595,33 @@ export class FileProcessingQueue {
     // 检查重试队列中的文件
     for (const [filePath, item] of this.retryQueue.entries()) {
       // 检查是否超过最大重试次数
-      if (item.attempts >= this.config.maxRetries!) {
+      const maxRetries = this.getMaxRetriesForQueue(item.targetQueue);
+      if (item.attempts >= maxRetries) {
         failedItems.push(filePath);
         continue;
       }
       
       // 检查是否满足重试延迟
       const timeSinceLastAttempt = currentTime - item.lastAttempt;
-      if (timeSinceLastAttempt >= this.options.stabilityRetryDelay) {
+      const retryDelay = this.queueConfig.stabilityRetryDelay || 2000;
+      
+      if (timeSinceLastAttempt >= retryDelay) {
         readyToRetry.push(item);
       }
     }
     
     // 处理失败的文件
     failedItems.forEach(filePath => {
-      this.markAsFailed(filePath);
+      const item = this.retryQueue.get(filePath);
+      if (item) {
+        const failureItem: FailureItem = {
+          type: this.getFailureTypeForQueue(item.targetQueue),
+          path: filePath,
+          error: `超过最大重试次数(${this.getMaxRetriesForQueue(item.targetQueue)})，停止重试`
+        };
+        
+        this.markAsFailed(filePath, failureItem);
+      }
     });
     
     // 如果没有准备好重试的文件，直接返回
@@ -370,24 +650,60 @@ export class FileProcessingQueue {
   /**
    * 获取队列统计信息
    */
-  public getQueueStats() {
+  public getQueueStats(): QueueStats {
+    const waiting = 
+      this.fileStabilityQueue.length +
+      this.archiveStabilityQueue.length +
+      this.md5Queue.length +
+      this.packagingQueue.length +
+      this.transportQueue.length;
+    
+    const processing = 
+      (this.processing.get('fileStability')?.size || 0) +
+      (this.processing.get('archiveStability')?.size || 0) +
+      (this.processing.get('md5')?.size || 0) +
+      (this.processing.get('packaging')?.size || 0) +
+      (this.processing.get('transport')?.size || 0);
+    
     return {
-      matched: this.matchedQueue.length,
-      stability: this.stabilityQueue.length,
-      md5: this.md5Queue.length,
-      packaging: this.packagingQueue.length,
-      transport: this.transportQueue.length,
+      waiting,
+      processing,
+      completed: this.completedFiles.size,
+      failed: this.failedFiles.size,
+      retrying: this.retryQueue.size,
+      total: waiting + processing + this.completedFiles.size + this.failedFiles.size + this.retryQueue.size
+    };
+  }
+  
+  /**
+   * 获取详细队列统计信息
+   */
+  public getDetailedQueueStats() {
+    return {
+      fileStability: {
+        waiting: this.fileStabilityQueue.length,
+        processing: this.processing.get('fileStability')?.size || 0
+      },
+      archiveStability: {
+        waiting: this.archiveStabilityQueue.length,
+        processing: this.processing.get('archiveStability')?.size || 0
+      },
+      md5: {
+        waiting: this.md5Queue.length,
+        processing: this.processing.get('md5')?.size || 0
+      },
+      packaging: {
+        waiting: this.packagingQueue.length,
+        processing: this.processing.get('packaging')?.size || 0
+      },
+      transport: {
+        waiting: this.transportQueue.length,
+        processing: this.processing.get('transport')?.size || 0
+      },
       retrying: this.retryQueue.size,
       completed: this.completedFiles.size,
       failed: this.failedFiles.size,
-      total: this.matchedQueue.length +
-             this.stabilityQueue.length +
-             this.md5Queue.length +
-             this.packagingQueue.length +
-             this.transportQueue.length +
-             this.retryQueue.size +
-             this.completedFiles.size +
-             this.failedFiles.size
+      total: this.getQueueStats().total
     };
   }
   
@@ -396,7 +712,8 @@ export class FileProcessingQueue {
    */
   public clear(): void {
     this.matchedQueue = [];
-    this.stabilityQueue = [];
+    this.fileStabilityQueue = [];
+    this.archiveStabilityQueue = [];
     this.md5Queue = [];
     this.packagingQueue = [];
     this.transportQueue = [];
@@ -404,6 +721,11 @@ export class FileProcessingQueue {
     this.completedFiles.clear();
     this.failedFiles.clear();
     this.pathMap.clear();
+    
+    // 清空压缩包追踪器
+    this.archiveTracker.archiveToFiles.clear();
+    this.archiveTracker.isQueued.clear();
+    this.archiveTracker.status.clear();
     
     // 清空处理中集合
     for (const set of this.processing.values()) {
@@ -418,7 +740,8 @@ export class FileProcessingQueue {
     // 检查所有普通队列是否为空
     if (
       this.matchedQueue.length > 0 ||
-      this.stabilityQueue.length > 0 ||
+      this.fileStabilityQueue.length > 0 ||
+      this.archiveStabilityQueue.length > 0 ||
       this.md5Queue.length > 0 ||
       this.packagingQueue.length > 0 ||
       this.transportQueue.length > 0 ||
@@ -458,10 +781,10 @@ export class FileProcessingQueue {
    */
   public getFilesInQueue(queueType: QueueType): FileItem[] {
     switch (queueType) {
-      case 'matched':
-        return [...this.matchedQueue];
-      case 'stability':
-        return [...this.stabilityQueue];
+      case 'fileStability':
+        return [...this.fileStabilityQueue];
+      case 'archiveStability':
+        return [...this.archiveStabilityQueue];
       case 'md5':
         return [...this.md5Queue];
       case 'packaging':
@@ -471,5 +794,16 @@ export class FileProcessingQueue {
       default:
         return [];
     }
+  }
+  
+  /**
+   * 获取压缩包追踪器，用于调试
+   */
+  public getArchiveTracker(): ArchiveTracker {
+    return {
+      archiveToFiles: new Map(this.archiveTracker.archiveToFiles),
+      isQueued: new Map(this.archiveTracker.isQueued),
+      status: new Map(this.archiveTracker.status)
+    };
   }
 } 
