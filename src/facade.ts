@@ -34,7 +34,7 @@ async function logToFile(filePath: string, message: string): Promise<void> {
 // 默认值定义
 const DEFAULT_OUTPUT_DIR = './temp/packages';
 const DEFAULT_RESULTS_DIR = './results';
-const DEFAULT_PACKAGE_NAME_PATTERN = 'package_{date}_{index}';
+const DEFAULT_PACKAGE_NAME_PATTERN = 'package_{taskId}_{index}';
 const DEFAULT_MAX_FILE_SIZE = 500 * 1024 * 1024; // 500 MB
 const DEFAULT_SKIP_DIRS: string[] = [];
 const DEFAULT_DEPTH = -1;
@@ -728,9 +728,7 @@ export async function scanAndTransport(config: ScanAndTransportConfig): Promise<
 
     // 辅助函数：生成包路径 (保持不变)
     const packagePathPrefix = (index: number): string => {
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
       const packageName = packageNamePattern
-        .replace('{date}', timestamp)
         .replace('{index}', String(index))
         .replace('{taskId}', taskId);
       return path.join(outputDir, `${packageName}.zip`);

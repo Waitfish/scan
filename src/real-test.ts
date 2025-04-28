@@ -119,7 +119,7 @@ async function main(): Promise<void> {
       scanNestedArchives: true,
       calculateMd5: true,
       packagingTrigger: {
-        maxFiles: 3,  // <--- 修改为 10
+        maxFiles: 5,  // <--- 修改为 10
         maxSizeMB: 10   // <--- 修改为 10
       },
       transport: {
