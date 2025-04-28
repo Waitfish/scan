@@ -21,6 +21,8 @@ export interface FileItem {
   path: string;
   /** 文件名 (对于压缩包内文件，指内部文件的名称) */
   name: string;
+  /** 文件原始名称（未重命名前的名称，用于处理文件名冲突时记录） */
+  originalName?: string;
   /** 文件创建时间 (对于压缩包内文件，使用压缩包的创建时间) */
   createTime: Date;
   /** 文件修改时间 (对于压缩包内文件，使用压缩包的修改时间) */
@@ -39,6 +41,13 @@ export interface FileItem {
   nestedPath?: string;
   /** 文件的md5值 */
   md5?: string;
+  /** 额外元数据，用于存储其他信息如稳定性检测的结果 */
+  metadata?: {
+    /** 文件修改时间的ISO字符串，用于稳定性检测 */
+    mtime?: string;
+    /** 其他元数据 */
+    [key: string]: any;
+  };
 }
 
 /** 文件匹配规则：[后缀列表, 文件名正则] */

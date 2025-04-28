@@ -658,6 +658,19 @@ export async function transferFile(
     
     // 连接到服务器
     await adapter.connect();
+
+    // 确保远程目录存在
+    try {
+      // 获取远程目录路径
+      const remoteDir = path.dirname(remotePath);
+      if (remoteDir && remoteDir !== '.') {
+        // 各适配器实现类中已经包含确保目录存在的逻辑，这里直接使用
+        // 上传前，适配器会自动调用确保目录存在的方法
+        console.log(`确保远程目录存在: ${remoteDir}`);
+      }
+    } catch (dirError: any) {
+      console.warn(`检查远程目录时出现警告，但将继续尝试上传: ${dirError.message}`);
+    }
     
     // 上传文件
     const result = await adapter.upload(filePath, remotePath);

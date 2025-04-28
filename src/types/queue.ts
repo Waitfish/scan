@@ -42,6 +42,20 @@ export interface FileStabilityConfig extends BaseStabilityConfig {
 
 /** 压缩包稳定性检测配置 */
 export interface ArchiveStabilityConfig extends BaseStabilityConfig {
+  /**
+   * 是否在提取内容时跳过大文件
+   */
+  skipLargeFiles?: boolean;
+  
+  /**
+   * 大文件阈值（字节）
+   */
+  largeFileThreshold?: number;
+  
+  /**
+   * 对于大文件是否跳过文件读取检查
+   */
+  skipReadForLargeFiles?: boolean;
   /** 解压后要保留的临时文件? (默认: false) */
   keepTempFiles?: boolean;
   /** 临时文件目录 (默认: 系统临时目录) */

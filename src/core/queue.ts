@@ -72,7 +72,13 @@ export class FileProcessingQueue {
   private pathMap: Map<string, FileItem> = new Map();
   
   // 处理中的文件数量
-  private processing: Map<QueueType, Set<string>> = new Map();
+  private processing: Map<QueueType, Set<string>> = new Map([
+    ['fileStability', new Set<string>()],
+    ['archiveStability', new Set<string>()],
+    ['md5', new Set<string>()],
+    ['packaging', new Set<string>()],
+    ['transport', new Set<string>()],
+  ]);
   
   // 压缩包追踪器
   private archiveTracker: ArchiveTracker = {
@@ -126,12 +132,18 @@ export class FileProcessingQueue {
       }
     };
     
-    // 初始化处理中集合
-    this.processing.set('fileStability', new Set());
-    this.processing.set('archiveStability', new Set());
-    this.processing.set('md5', new Set());
-    this.processing.set('packaging', new Set());
-    this.processing.set('transport', new Set());
+    // 确保 processing Map 被初始化
+    this.initializeProcessingMap();
+  }
+  
+  private initializeProcessingMap(): void {
+    this.processing = new Map([
+      ['fileStability', new Set<string>()],
+      ['archiveStability', new Set<string>()],
+      ['md5', new Set<string>()],
+      ['packaging', new Set<string>()],
+      ['transport', new Set<string>()],
+    ]);
   }
   
   /**
@@ -494,6 +506,14 @@ export class FileProcessingQueue {
   }
   
   /**
+   * 获取指定队列的处理中文件集合
+   * @param queueType 队列类型
+   */
+  public getProcessingSet(queueType: QueueType): Set<string> | undefined {
+    return this.processing.get(queueType);
+  }
+  
+  /**
    * 批量处理队列中的下一批文件
    * @param targetQueue 目标队列类型
    * @param batchSize 批处理大小
@@ -504,62 +524,44 @@ export class FileProcessingQueue {
     batchSize: number, 
     processor: (files: FileItem[]) => void
   ): void {
-    let sourceQueue: FileItem[] = [];
-    
-    // 根据目标队列确定源队列
-    switch (targetQueue) {
-      case 'fileStability':
-        // 源队列是已处理的匹配队列
-        this.processMatchedQueue();
-        sourceQueue = this.fileStabilityQueue;
-        break;
-      case 'archiveStability':
-        // 源队列是已处理的匹配队列
-        this.processMatchedQueue();
-        sourceQueue = this.archiveStabilityQueue;
-        break;
-      case 'md5':
-        // 源队列是已经稳定的文件
-        sourceQueue = this.md5Queue;
-        break;
-      case 'packaging':
-        // 源队列是已经计算MD5的文件
-        sourceQueue = this.packagingQueue;
-        break;
-      case 'transport':
-        // 源队列是已经打包的文件
-        sourceQueue = this.transportQueue;
-        break;
+    const originalQueue = this.getOriginalQueue(targetQueue);
+    if (!originalQueue) {
+      console.error(`无效的队列类型: ${targetQueue}`);
+      return;
     }
     
     // 调整批处理大小，确保不超过配置的并发数
     const maxConcurrent = this.getMaxConcurrentForQueue(targetQueue);
     const processingSet = this.processing.get(targetQueue) || new Set();
     const availableSlots = Math.max(0, maxConcurrent - processingSet.size);
-    const actualBatchSize = Math.min(batchSize, availableSlots);
+    const actualBatchSize = Math.min(batchSize, availableSlots, originalQueue.length); // 使用原始队列长度
     
-    // 不能超过批处理大小
-    const batch = sourceQueue.slice(0, actualBatchSize);
+    // 从原始队列获取批次
+    const batch = originalQueue.slice(0, actualBatchSize);
     if (batch.length === 0) return;
     
-    // 从源队列移除
-    batch.forEach(file => {
-      const index = sourceQueue.findIndex(item => item.path === file.path);
-      if (index !== -1) {
-        sourceQueue.splice(index, 1);
-      }
-    });
+    // 从原始队列移除 (现在从头部移除)
+    originalQueue.splice(0, actualBatchSize); // 从原始队列移除处理中的项
     
     // 标记为处理中
     batch.forEach(file => {
-      const processingSet = this.processing.get(targetQueue);
-      if (processingSet) {
-        processingSet.add(file.path);
-      }
+      // processing Set 应该已经被初始化
+      this.processing.get(targetQueue)!.add(file.path);
     });
     
     // 调用处理函数
     processor(batch);
+  }
+
+  private getOriginalQueue(queueType: QueueType): FileItem[] | null {
+    switch (queueType) {
+        case 'fileStability': return this.fileStabilityQueue;
+        case 'archiveStability': return this.archiveStabilityQueue;
+        case 'md5': return this.md5Queue;
+        case 'packaging': return this.packagingQueue;
+        case 'transport': return this.transportQueue;
+        default: return null;
+    }
   }
   
   /**
@@ -727,10 +729,8 @@ export class FileProcessingQueue {
     this.archiveTracker.isQueued.clear();
     this.archiveTracker.status.clear();
     
-    // 清空处理中集合
-    for (const set of this.processing.values()) {
-      set.clear();
-    }
+    // 重新初始化处理中集合
+    this.initializeProcessingMap();
   }
   
   /**
@@ -797,13 +797,10 @@ export class FileProcessingQueue {
   }
   
   /**
-   * 获取压缩包追踪器，用于调试
+   * 获取压缩包追踪器
+   * @returns 压缩包追踪器
    */
   public getArchiveTracker(): ArchiveTracker {
-    return {
-      archiveToFiles: new Map(this.archiveTracker.archiveToFiles),
-      isQueued: new Map(this.archiveTracker.isQueued),
-      status: new Map(this.archiveTracker.status)
-    };
+    return this.archiveTracker;
   }
 } 

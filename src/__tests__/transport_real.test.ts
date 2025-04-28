@@ -331,6 +331,40 @@ describe('transferFile函数真实服务器测试', () => {
     }
   }, TEST_TIMEOUT);
   
+  // 添加测试：验证自动创建深层嵌套目录功能
+  maybeskip('应该能自动创建深层嵌套的远程目录', async () => {
+    try {
+      // 定义一个深层嵌套的目录路径
+      const deepNestedPath = `deep/nested/dir/structure/${Date.now()}`;
+      
+      const result = await transferFile(
+        testFile,
+        `${deepNestedPath}/nested-test-file.txt`,
+        ftpsConfig
+      );
+      
+      // 应该成功连接并上传，证明嵌套目录已被创建
+      expect(result.success).toBe(true);
+      expect(result.remotePath).toContain(deepNestedPath);
+      expect(result.remotePath).toContain('nested-test-file.txt');
+      
+      // 验证刚刚创建的目录中上传另一个文件也能成功
+      const secondResult = await transferFile(
+        testFile,
+        `${deepNestedPath}/second-file.txt`,
+        ftpsConfig
+      );
+      
+      expect(secondResult.success).toBe(true);
+      expect(secondResult.remotePath).toContain(`${deepNestedPath}/second-file.txt`);
+      
+      console.log(`成功创建深层嵌套目录并上传文件: ${result.remotePath}`);
+    } catch (error: any) {
+      console.error('创建深层嵌套目录测试失败:', error.message);
+      throw error;
+    }
+  }, TEST_TIMEOUT);
+  
   test('应该能处理禁用状态', async () => {
     const disabledConfig = { ...ftpsConfig, enabled: false };
     const result = await transferFile(testFile, 'disabled-test.txt', disabledConfig);
@@ -390,6 +424,45 @@ describe('传输特殊场景测试', () => {
       await adapter.disconnect();
     } catch (error: any) {
       console.error('测试覆盖远程文件失败:', error.message);
+      throw error;
+    }
+  }, TEST_TIMEOUT);
+  
+  // 添加测试：多文件上传到嵌套目录场景
+  maybeskip('应该能将多个文件上传到自动创建的嵌套目录中', async () => {
+    try {
+      // 创建测试文件集
+      const testFiles = await createTestFiles(5);
+      
+      // 创建一个带时间戳的目录名，确保每次测试使用不同的目录
+      const timestampDir = `nested-batch-${Date.now()}`;
+      const nestedRemotePath = `queue-test/${timestampDir}/files`;
+      
+      console.log(`测试上传多文件到嵌套目录: ${nestedRemotePath}`);
+      
+      // 模拟传输队列场景，一个接一个地上传文件到相同的嵌套目录
+      const results = [];
+      for (let i = 0; i < testFiles.length; i++) {
+        const remotePath = `${nestedRemotePath}/file-${i}.txt`;
+        const result = await transferFile(
+          testFiles[i],
+          remotePath,
+          ftpsConfig
+        );
+        results.push(result);
+        
+        // 验证每个文件的上传结果
+        expect(result.success).toBe(true);
+        expect(result.remotePath).toContain(remotePath);
+      }
+      
+      // 验证所有文件都成功上传
+      expect(results.length).toBe(testFiles.length);
+      expect(results.every(r => r.success)).toBe(true);
+      
+      console.log(`成功上传 ${results.length} 个文件到自动创建的嵌套目录 ${nestedRemotePath}`);
+    } catch (error: any) {
+      console.error('多文件上传到嵌套目录测试失败:', error.message);
       throw error;
     }
   }, TEST_TIMEOUT);
