@@ -256,29 +256,15 @@ export async function scanAndTransport(config: ScanAndTransportConfig): Promise<
     // 12. 处理MD5计算队列
     await logToFile(logFilePath, `开始处理MD5计算队列...`);
     await processMd5Queue();
-    await logToFile(logFilePath, `MD5计算队列处理初步完成，等待所有相关文件处理完毕...`);
-
-    // ---> 新增：等待所有文件完成MD5计算阶段 <--- 
-    await waitForCondition(() => 
-      queue.getFilesInQueue('fileStability').length === 0 &&
-      (queue.getProcessingSet('fileStability')?.size ?? 0) === 0 &&
-      queue.getFilesInQueue('archiveStability').length === 0 &&
-      (queue.getProcessingSet('archiveStability')?.size ?? 0) === 0 &&
-      queue.getFilesInQueue('md5').length === 0 &&
-      (queue.getProcessingSet('md5')?.size ?? 0) === 0, 
-      logFilePath, 
-      'MD5 及前置队列'
-    );
-    await logToFile(logFilePath, `所有文件已完成 MD5 计算阶段 (或失败)`);
-    // ---> 结束新增 <--- 
+    await logToFile(logFilePath, `MD5计算队列处理初步完成`);
 
     // 获取打包队列长度
     const packagingQueueLength = queue.getFilesInQueue('packaging').length;
-    await logToFile(logFilePath, `准备处理打包队列，队列长度: ${packagingQueueLength}`);
+    await logToFile(logFilePath, `准备处理打包队列，初始队列长度: ${packagingQueueLength}`);
     
     // 13. 处理打包队列
     await processPackagingQueue();
-    await logToFile(logFilePath, `打包队列处理完成`);
+    await logToFile(logFilePath, `打包队列处理完成 (函数已返回)`);
     
     // 14. 处理传输队列
     await logToFile(logFilePath, `开始处理传输队列...`);
@@ -725,28 +711,22 @@ export async function scanAndTransport(config: ScanAndTransportConfig): Promise<
    * 处理打包队列
    */
   async function processPackagingQueue(): Promise<void> {
-    await logToFile(logFilePath, `开始处理打包队列`);
-    
-    const filesToPackage = queue.getFilesInQueue('packaging');
-    await logToFile(logFilePath, `打包队列中文件数量: ${filesToPackage.length}`);
-    
-    if (filesToPackage.length === 0) {
-      await logToFile(logFilePath, `打包队列为空，无需处理`);
-      return; // 没有文件需要打包
-    }
+    await logToFile(logFilePath, `启动打包队列处理逻辑`);
 
-    // 将所有待处理文件标记为处理中
-    const processingSet = queue.getProcessingSet('packaging');
-    filesToPackage.forEach(file => processingSet?.add(file.path));
-    // 从等待队列中移除 (因为我们要一次性处理完)
-    const packagingQueueRef = (queue as any).packagingQueue as FileItem[]; // 获取内部队列引用 (需要类型断言或方法)
-    packagingQueueRef.length = 0; // 清空等待队列
-
+    // 状态变量：在 processor 调用之间保持
     let currentPackageFiles: FileItem[] = [];
     let currentPackageSize = 0;
     let packageIndex = 0;
 
-    // 辅助函数用于创建包路径
+    // 确保输出目录存在 (移到内部，确保执行)
+    try {
+      await fs.ensureDir(outputDir);
+    } catch (dirError: any) {
+      await logToFile(logFilePath, `创建输出目录 ${outputDir} 失败: ${dirError.message}`);
+      // 如果目录创建失败，后续打包会失败，错误会在 createAndAddPackage 中处理
+    }
+
+    // 辅助函数：生成包路径 (保持不变)
     const packagePathPrefix = (index: number): string => {
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
       const packageName = packageNamePattern
@@ -756,7 +736,7 @@ export async function scanAndTransport(config: ScanAndTransportConfig): Promise<
       return path.join(outputDir, `${packageName}.zip`);
     };
 
-    // 辅助函数用于实际创建包和处理结果 (保持不变)
+    // 辅助函数：创建并添加包 (保持不变，但错误处理更细致)
     const createAndAddPackage = async (packageFiles: FileItem[], targetPath: string): Promise<void> => {
         const packageSize = packageFiles.reduce((sum, f) => sum + (f.size || 0), 0);
         await logToFile(logFilePath, `创建打包: ${targetPath}, 包含 ${packageFiles.length} 个文件, 总大小: ${(packageSize / (1024 * 1024)).toFixed(2)}MB`);
@@ -776,17 +756,18 @@ export async function scanAndTransport(config: ScanAndTransportConfig): Promise<
           if (packResult.success) {
             packagePaths.push(targetPath);
             for (const packagedFile of packageFiles) {
-              // 文件已打包，但尚未传输，状态不是 completed，先不调用 markAsCompleted
               if (!packagedFile.metadata) packagedFile.metadata = {};
               packagedFile.metadata.packagePath = targetPath;
+              // 注意：文件打包成功不代表整个流程完成，不在此处调用 markAsCompleted
             }
             // 创建代表包的 FileItem 并加入传输队列
+            const packageStat = await fs.stat(targetPath);
             queue.addToQueue('transport', {
               path: targetPath,
               name: path.basename(targetPath),
               createTime: new Date(),
               modifyTime: new Date(),
-              size: (await fs.stat(targetPath)).size,
+              size: packageStat.size,
               origin: 'filesystem',
               metadata: {
                 packagedFiles: packageFiles.map(f => f.path),
@@ -796,68 +777,154 @@ export async function scanAndTransport(config: ScanAndTransportConfig): Promise<
             });
             await logToFile(logFilePath, `打包成功，包已加入传输队列: ${targetPath}`);
           } else {
-            await logToFile(logFilePath, `打包失败: ${packResult.error?.message || '未知错误'}`);
+            const errMsg = `打包失败: ${packResult.error?.message || '未知错误'}`;
+            await logToFile(logFilePath, errMsg);
             for (const packagedFile of packageFiles) {
-              failedItems.push({ type: 'packaging', path: packagedFile.path, error: `打包失败: ${packResult.error?.message || '未知错误'}` });
-              queue.markAsFailed(packagedFile.path); // 标记原始文件为失败
+              if (!failedItems.some(fi => fi.path === packagedFile.path)) { // 避免重复记录失败
+                 failedItems.push({ type: 'packaging', path: packagedFile.path, error: errMsg });
+                 queue.markAsFailed(packagedFile.path); // 标记原始文件为失败
+              }
             }
+            // 抛出错误以便上层知道创建包失败
+            throw new Error(errMsg);
           }
         } catch (error: any) {
-           await logToFile(logFilePath, `打包过程发生异常: ${error.message}`);
+           const errMsg = `打包过程发生异常: ${error.message}`;
+           await logToFile(logFilePath, errMsg);
            for (const packagedFile of packageFiles) {
-             failedItems.push({ type: 'packaging', path: packagedFile.path, error: `打包异常: ${error.message}` });
-             queue.markAsFailed(packagedFile.path); // 标记原始文件为失败
+             if (!failedItems.some(fi => fi.path === packagedFile.path)) {
+                failedItems.push({ type: 'packaging', path: packagedFile.path, error: errMsg });
+                queue.markAsFailed(packagedFile.path);
+             }
            }
+           // 抛出错误
+           throw new Error(errMsg);
         }
     };
 
-    try {
-      await fs.ensureDir(outputDir);
-      
-      for (const file of filesToPackage) {
-        currentPackageFiles.push(file);
-        currentPackageSize += file.size || 0;
+    // --- 主处理逻辑 --- 
+    return new Promise<void>((resolve) => {
+      let checkInProgress = false; // 防止并发检查
 
-        const fileTrigger = currentPackageFiles.length >= packagingTrigger.maxFiles;
-        const sizeTrigger = currentPackageSize >= packagingTrigger.maxSizeMB * 1024 * 1024;
+      // 检查是否所有处理都完成，可以创建最终包并结束
+      const checkCompletion = async () => {
+        if (checkInProgress) {
+          await logToFile(logFilePath, `完成状态检查已在进行中，跳过`);
+          return;
+        }
+        checkInProgress = true;
+        await logToFile(logFilePath, `开始检查打包完成状态...`);
 
-        if (fileTrigger || sizeTrigger) {
-          // 达到阈值，创建包 (但不包括当前文件，当前文件放入下一个包)
-          const filesForThisPackage = currentPackageFiles.slice(0, -1); 
-          if (filesForThisPackage.length > 0) {
-             await createAndAddPackage(filesForThisPackage, packagePathPrefix(packageIndex++));
-             // 更新当前包为只包含最后一个文件
-             currentPackageFiles = [file]; 
-             currentPackageSize = file.size || 0; 
+        const stats = queue.getDetailedQueueStats();
+        const packagingWaiting = queue.getFilesInQueue('packaging').length;
+        const packagingProcessing = stats.packaging.processing;
+
+        // 关键条件：上游队列完成 + 打包队列完成
+        const upstreamDone = 
+          stats.fileStability.waiting === 0 && stats.fileStability.processing === 0 &&
+          stats.archiveStability.waiting === 0 && stats.archiveStability.processing === 0 &&
+          stats.md5.waiting === 0 && stats.md5.processing === 0;
+          
+        const packagingDone = packagingWaiting === 0 && packagingProcessing === 0;
+
+        await logToFile(logFilePath, `完成状态: 上游=${upstreamDone}, 打包=${packagingDone} (等待:${packagingWaiting}, 处理中:${packagingProcessing}), 剩余当前包=${currentPackageFiles.length}`);
+
+        if (upstreamDone && packagingDone) {
+          // 所有条件满足，处理最后一个包
+          if (currentPackageFiles.length > 0) {
+            await logToFile(logFilePath, `所有处理完成，创建最后一个包含 ${currentPackageFiles.length} 个文件的包`);
+            const filesToPack = [...currentPackageFiles]; // 捕获当前状态
+            const finalPackagePath = packagePathPrefix(packageIndex++);
+            currentPackageFiles = []; // 重置状态
+            currentPackageSize = 0;
+            try {
+                await createAndAddPackage(filesToPack, finalPackagePath);
+            } catch(e: any) {
+                 await logToFile(logFilePath, `创建最后一个包时出错: ${e.message}`);
+                 // 错误已在 createAndAddPackage 中记录和标记
+            }
           } else {
-             // 如果恰好达到阈值的是第一个文件，也创建包（虽然不太可能触发）
-             await createAndAddPackage([file], packagePathPrefix(packageIndex++));
-             currentPackageFiles = [];
-             currentPackageSize = 0;
+             await logToFile(logFilePath, `所有处理完成，没有剩余文件需要打包`);
           }
+          await logToFile(logFilePath, `解析打包队列 Promise (完成)`);
+          checkInProgress = false;
+          resolve(); // **** 解析 Promise ****
+        } else {
+          // 打包或上游未完成，调度延迟检查
+          logToFile(logFilePath, `[PackageQueue] Packaging or upstream tasks not complete, scheduling delayed check for ${currentPackageFiles.length} items after 1000ms.`);
+          setTimeout(
+            () => processPackagingQueue(),
+            1000
+          );
         }
+      };
+
+      // 处理从队列中取出的一批文件
+      const processor = async (files: FileItem[]) => {
+        await logToFile(logFilePath, `处理打包批次: ${files.length} 个文件`);
+
+        for (const file of files) {
+          currentPackageFiles.push(file);
+          currentPackageSize += file.size || 0;
+          await logToFile(logFilePath, `文件 ${file.name} 加入当前包 (现有 ${currentPackageFiles.length} 文件, ${currentPackageSize} B)`);
+
+          const fileTrigger = currentPackageFiles.length >= packagingTrigger.maxFiles;
+          const sizeTrigger = currentPackageSize >= packagingTrigger.maxSizeMB * 1024 * 1024;
+
+          if (fileTrigger || sizeTrigger) {
+             await logToFile(logFilePath, `打包触发器满足 (文件: ${fileTrigger}, 大小: ${sizeTrigger}), 创建包`);
+            const filesToPack = [...currentPackageFiles]; // 捕获状态
+            const packagePath = packagePathPrefix(packageIndex++);
+            // 重置共享状态 *之前* await
+            currentPackageFiles = [];
+            currentPackageSize = 0;
+            try {
+              await createAndAddPackage(filesToPack, packagePath);
+            } catch (e: any) {
+                logToFile(logFilePath, `创建包 ${packagePath} 时捕获错误: ${e.message}`);
+                // 错误已在 createAndAddPackage 中处理，此处仅记录
+            }
+          } else {
+              logToFile(logFilePath, `文件 ${file.name} 加入后未触发打包`);
+          }
+        } // 结束 for 循环
+
+        // 标记本批次文件处理完成 (从 processing 集合中移除)
+        files.forEach(file => {
+          queue.getProcessingSet('packaging')?.delete(file.path);
+        });
+        await logToFile(logFilePath, `批次 ${files.map(f=>f.name).join(',')} 标记为打包处理完成`);
+
+        // 处理完一批后，检查是否需要处理下一批，或者是否应该检查完成状态
+        const packagingWaiting = queue.getFilesInQueue('packaging').length;
+        const packagingProcessing = queue.getDetailedQueueStats().packaging.processing; // 检查其他processor是否还在运行
+
+        if (packagingWaiting > 0 || packagingProcessing > 0) {
+            logToFile(logFilePath, `打包队列仍有 ${packagingWaiting} 等待 / ${packagingProcessing} 处理中，调度下一批次`);
+            // 如果还有文件在等待队列或正在被其他 processor 处理，继续调度
+            // 使用较小的批次大小以允许更频繁地检查触发器
+            queue.processNextBatch('packaging', packagingTrigger.maxFiles || 10, processor);
+        } else {
+             logToFile(logFilePath, `打包队列已空或无处理中，开始检查最终完成状态`);
+            // 如果没有文件在等待，并且没有其他 processor 在运行，开始检查是否可以完成
+            checkCompletion();
+        }
+      }; // 结束 processor 函数
+
+      // 初始触发器：开始处理第一批
+      const initialBatchSize = packagingTrigger.maxFiles > 0 ? packagingTrigger.maxFiles : 10; // 初始批次大小
+      logToFile(logFilePath, `首次触发打包处理器，批次大小: ${initialBatchSize}`);
+      queue.processNextBatch('packaging', initialBatchSize, processor);
+
+      // 处理初始队列为空的情况：仍然需要启动检查完成状态的循环
+      const initialFiles = queue.getFilesInQueue('packaging');
+      const initialProcessing = queue.getDetailedQueueStats().packaging.processing;
+      if(initialFiles.length === 0 && initialProcessing === 0) {
+          logToFile(logFilePath, `打包队列初始为空且无处理中，直接启动完成状态检查`);
+          checkCompletion();
       }
 
-      // 处理循环结束后剩余的文件
-      if (currentPackageFiles.length > 0) {
-        await logToFile(logFilePath, `处理打包队列末尾剩余的文件: ${currentPackageFiles.length} 个`);
-        await createAndAddPackage(currentPackageFiles, packagePathPrefix(packageIndex++));
-      }
-
-    } catch (error: any) {
-      await logToFile(logFilePath, `处理打包队列时发生未捕获错误: ${error.message}`);
-      // 将所有待处理文件标记为失败
-      filesToPackage.forEach(file => {
-        if (!queue.getFailedFiles().some(f => f.path === file.path)) { // 避免重复添加
-           failedItems.push({ type: 'packaging', path: file.path, error: `打包处理异常: ${error.message}` });
-           queue.markAsFailed(file.path);
-        }
-      });
-    } finally {
-      // 无论成功或失败，都要将这些文件从处理中状态移除
-      filesToPackage.forEach(file => processingSet?.delete(file.path));
-      await logToFile(logFilePath, `打包队列处理完成`);
-    }
+    }); // 结束 Promise
   }
   
   /**
@@ -1001,34 +1068,4 @@ export async function scanAndTransport(config: ScanAndTransportConfig): Promise<
       }
     });
   }
-
-  // ---> 新增：通用等待条件函数 <--- 
-  async function waitForCondition(
-    conditionFn: () => boolean, 
-    logPath: string, 
-    conditionName: string, 
-    checkIntervalMs: number = 500, 
-    timeoutMs: number = 300000 // 5 minutes timeout
-  ): Promise<void> {
-    const startTime = Date.now();
-    return new Promise((resolve, reject) => {
-      const check = () => {
-        if (conditionFn()) {
-          logToFile(logPath, `条件 \"${conditionName}\" 已满足。`).catch(console.error);
-          resolve();
-        } else if (Date.now() - startTime > timeoutMs) {
-          const errorMsg = `等待条件 \"${conditionName}\" 超时 (${timeoutMs}ms)。`;
-          logToFile(logPath, errorMsg).catch(console.error);
-          reject(new Error(errorMsg));
-        } else {
-          // 记录当前队列状态 (可选，用于调试)
-          // const stats = queue.getDetailedQueueStats();
-          // logToFile(logPath, `等待条件 \"${conditionName}\"... 当前状态: ${JSON.stringify(stats)}`).catch(console.error);
-          setTimeout(check, checkIntervalMs);
-        }
-      };
-      check(); // Start the first check
-    });
-  }
-  // ---> 结束新增 <--- 
 } 
