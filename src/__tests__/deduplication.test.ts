@@ -359,5 +359,115 @@ describe('文件去重功能', () => {
       
       timerSpy.mockRestore();
     });
+
+    // 新增：测试从压缩文件中提取的文件去重计数
+    test('测试压缩文件与正常文件的历史去重计数', async () => {
+      // 创建测试历史记录文件，包含一些MD5
+      const md5Values = ['historical-md5-1', 'historical-md5-2', 'historical-md5-3'];
+      await fs.writeJson(historyFilePath, md5Values);
+      
+      const deduplicator = createDeduplicator({
+        useHistoricalDeduplication: true,
+        useTaskDeduplication: true,
+        historyFilePath
+      });
+      
+      // 初始化去重器
+      await deduplicator.initialize();
+      
+      // 确认历史记录已加载
+      expect(deduplicator.getHistoricalMd5Set().size).toBe(3);
+      
+      // 创建基础文件项
+      const baseFiles = [
+        // 普通文件，与历史记录中的文件重复
+        {
+          path: path.join(testDir, 'file1.txt'),
+          name: 'file1.txt',
+          size: 1024,
+          createTime: new Date(),
+          modifyTime: new Date(),
+          md5: 'historical-md5-1',
+          origin: 'filesystem' as const
+        },
+        // 普通文件，不重复
+        {
+          path: path.join(testDir, 'file2.txt'),
+          name: 'file2.txt',
+          size: 1024,
+          createTime: new Date(),
+          modifyTime: new Date(),
+          md5: 'new-md5-1',
+          origin: 'filesystem' as const
+        }
+      ];
+      
+      // 创建模拟压缩包中的文件项
+      const archiveFiles = [
+        // 压缩包中的文件，与历史记录中的文件重复
+        {
+          path: path.join(testDir, 'archive/file3.txt'),
+          name: 'file3.txt',
+          size: 1024,
+          createTime: new Date(),
+          modifyTime: new Date(),
+          md5: 'historical-md5-2',
+          origin: 'archive' as const,
+          archivePath: path.join(testDir, 'test.zip'),
+          internalPath: 'file3.txt'
+        },
+        // 压缩包中的另一个文件，与历史记录中的文件重复
+        {
+          path: path.join(testDir, 'archive/file4.txt'),
+          name: 'file4.txt',
+          size: 1024,
+          createTime: new Date(),
+          modifyTime: new Date(),
+          md5: 'historical-md5-3',
+          origin: 'archive' as const,
+          archivePath: path.join(testDir, 'test.zip'),
+          internalPath: 'file4.txt'
+        }
+      ];
+      
+      // 合并所有文件
+      const allFiles = [...baseFiles, ...archiveFiles];
+      
+      // 检查重复
+      for (const file of allFiles) {
+        deduplicator.checkDuplicate(file);
+      }
+      
+      // 获取历史重复文件列表
+      const skippedHistorical = deduplicator.getSkippedHistoricalDuplicates();
+      
+      // 应该有3个历史重复文件（1个普通文件和2个压缩包文件）
+      expect(skippedHistorical.length).toBe(3);
+      
+      // 统计不同来源的文件数量
+      const filesystemFiles = skippedHistorical.filter(f => f.origin === 'filesystem' || !f.origin);
+      const archiveFilesResult = skippedHistorical.filter(f => f.origin === 'archive');
+      
+      // 验证来源统计
+      expect(filesystemFiles.length).toBe(1); // 1个普通文件
+      expect(archiveFilesResult.length).toBe(2); // 2个压缩包文件
+      
+      // 打印详细结果，帮助诊断
+      console.log('历史重复文件列表详情:');
+      skippedHistorical.forEach((file, index) => {
+        console.log(`[${index+1}] 路径: ${file.path}, MD5: ${file.md5}, 来源: ${file.origin || 'filesystem'}`);
+      });
+      
+      // 确认队列中没有重复计数的文件
+      const pathMap = new Map<string, number>();
+      skippedHistorical.forEach(file => {
+        const path = file.path;
+        pathMap.set(path, (pathMap.get(path) || 0) + 1);
+      });
+      
+      // 检查是否有路径出现多次
+      const duplicatePaths = Array.from(pathMap.entries()).filter(([_, count]) => count > 1);
+      expect(duplicatePaths.length).toBe(0); // 不应该有重复计数的文件
+    });
   });
 }); 

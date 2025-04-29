@@ -44,6 +44,9 @@ export class Deduplicator {
   /** 任务内重复的文件 */
   private skippedTaskDuplicates: FileItem[];
   
+  /** 任务文件映射表 */
+  private taskFiles: Map<string, FileItem> = new Map();
+  
   /** 配置选项 */
   private options: DeduplicatorOptions;
   
@@ -102,58 +105,84 @@ export class Deduplicator {
   }
 
   /**
-   * 检查文件是否重复
-   * @param fileItem 文件项
+   * 判断文件是否重复，如果重复则给出重复类型
+   * @param file 文件项
+   * @param checkTask 是否检查任务内重复
+   * @param checkHistorical 是否检查历史任务重复
    * @returns 去重结果
    */
-  public checkDuplicate(fileItem: FileItem): DeduplicationResult {
-    // 如果未启用去重或文件没有MD5值，则视为非重复
-    if (!this.options.enabled || !fileItem.md5) {
-      console.log(`[去重] 跳过文件 ${fileItem.path} 的去重检查: ${!this.options.enabled ? '去重已禁用' : 'MD5值不存在'}`);
+  public checkDuplicate(
+    file: FileItem,
+    checkTask = true,
+    checkHistorical = true,
+  ): DeduplicationResult {
+    // 文件必须要有md5
+    if (!file.md5) {
+      console.log(`[去重] 文件缺少MD5，无法进行去重检查: ${file.path}`);
       return {
         isDuplicate: false,
         type: DeduplicationType.NOT_DUPLICATE,
-        fileItem
+        fileItem: file
       };
     }
 
-    const fileMd5 = fileItem.md5;
-    console.log(`[去重] 检查文件 ${fileItem.path} 是否重复, MD5: ${fileMd5}`);
+    const md5 = file.md5;
+    console.log(`[去重] 检查文件: ${file.path}，MD5: ${md5.substring(0, 8)}...`);
 
-    // 检查是否与历史记录重复
-    if (this.options.useHistoricalDeduplication && this.historicalMd5Set.has(fileMd5)) {
-      // 记录历史重复文件
-      this.skippedHistoricalDuplicates.push(fileItem);
-      console.log(`[去重] 文件 ${fileItem.path} 与历史记录中的文件重复 (MD5: ${fileMd5})`);
+    // 检查文件是否与历史任务的文件重复
+    if (checkHistorical && this.options.useHistoricalDeduplication && this.historicalMd5Set.has(md5)) {
+      // 记录文件被判定为历史重复时的详细信息
+      console.log(`[去重] 检测到历史重复文件: ${file.path}`);
+      console.log(`  - 文件名: ${file.name}`);
+      console.log(`  - 大小: ${file.size} 字节`);
+      console.log(`  - MD5: ${file.md5}`);
+      console.log(`  - 来源: ${file.origin || 'filesystem'}`);
+      if (file.origin === 'archive' && file.archivePath) {
+        console.log(`  - 归档文件路径: ${file.archivePath}`);
+      }
+      
+      // 将文件添加到历史重复列表
+      this.skippedHistoricalDuplicates.push(file);
+      console.log(`[去重] 已添加到历史重复列表，当前列表长度: ${this.skippedHistoricalDuplicates.length}`);
       
       return {
         isDuplicate: true,
         type: DeduplicationType.HISTORICAL_DUPLICATE,
-        fileItem
+        fileItem: file
       };
     }
 
-    // 检查是否在当前任务中重复
-    if (this.options.useTaskDeduplication && this.currentTaskMd5Set.has(fileMd5)) {
-      // 记录任务内重复文件
-      this.skippedTaskDuplicates.push(fileItem);
-      console.log(`[去重] 文件 ${fileItem.path} 在当前任务中重复 (MD5: ${fileMd5})`);
+    // 检查文件是否与当前任务的文件重复
+    if (checkTask && this.options.useTaskDeduplication && this.currentTaskMd5Set.has(md5)) {
+      // 记录文件被判定为任务重复时的详细信息
+      console.log(`[去重] 检测到任务内重复文件: ${file.path}`);
+      console.log(`  - 文件名: ${file.name}`);
+      console.log(`  - 大小: ${file.size} 字节`);
+      console.log(`  - MD5: ${file.md5}`);
+      console.log(`  - 来源: ${file.origin || 'filesystem'}`);
+      if (file.origin === 'archive' && file.archivePath) {
+        console.log(`  - 归档文件路径: ${file.archivePath}`);
+      }
+      
+      // 将文件添加到任务重复列表
+      this.skippedTaskDuplicates.push(file);
+      console.log(`[去重] 已添加到任务内重复列表，当前列表长度: ${this.skippedTaskDuplicates.length}`);
       
       return {
         isDuplicate: true,
         type: DeduplicationType.TASK_DUPLICATE,
-        fileItem
+        fileItem: file
       };
     }
 
-    // 如果不重复，将MD5值添加到当前任务集合中
-    this.currentTaskMd5Set.add(fileMd5);
-    console.log(`[去重] 文件 ${fileItem.path} 不重复，已添加到当前任务MD5集合 (MD5: ${fileMd5})`);
-    
+    // 文件不重复，添加到任务文件列表和当前任务MD5集合
+    console.log(`[去重] 文件不重复，添加到任务文件列表: ${file.path}`);
+    this.taskFiles.set(md5, file);
+    this.currentTaskMd5Set.add(md5);
     return {
       isDuplicate: false,
       type: DeduplicationType.NOT_DUPLICATE,
-      fileItem
+      fileItem: file
     };
   }
 
@@ -306,14 +335,36 @@ export class Deduplicator {
    * 获取与历史任务重复的文件
    */
   public getSkippedHistoricalDuplicates(): FileItem[] {
-    return [...this.skippedHistoricalDuplicates];
+    // 确保返回数组的副本，避免外部修改影响内部状态
+    // 清除重复项，确保每个文件只出现一次
+    const uniqueFiles = new Map<string, FileItem>();
+    
+    for (const file of this.skippedHistoricalDuplicates) {
+      if (file.path) {
+        uniqueFiles.set(file.path, file);
+      }
+    }
+    
+    // 返回去重后的文件列表
+    return Array.from(uniqueFiles.values());
   }
 
   /**
    * 获取任务内重复的文件
    */
   public getSkippedTaskDuplicates(): FileItem[] {
-    return [...this.skippedTaskDuplicates];
+    // 确保返回数组的副本，避免外部修改影响内部状态
+    // 清除重复项，确保每个文件只出现一次
+    const uniqueFiles = new Map<string, FileItem>();
+    
+    for (const file of this.skippedTaskDuplicates) {
+      if (file.path) {
+        uniqueFiles.set(file.path, file);
+      }
+    }
+    
+    // 返回去重后的文件列表
+    return Array.from(uniqueFiles.values());
   }
 
   /**

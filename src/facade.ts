@@ -311,9 +311,53 @@ export async function scanAndTransport(config: ScanAndTransportConfig): Promise<
       } as FailureItem;
     }));
     
-    // 添加去重的文件到结果中
-    skippedHistoricalDuplicates.push(...deduplicator.getSkippedHistoricalDuplicates());
-    skippedTaskDuplicates.push(...deduplicator.getSkippedTaskDuplicates());
+    // 直接从deduplicator获取去重的文件列表，不再将其追加到已有列表
+    // skippedHistoricalDuplicates在处理MD5时已经添加过了
+    // 这里使用Set进行去重，确保每个文件只出现一次
+    const histFilePaths = new Set<string>();
+    const uniqueHistoricalDuplicates: FileItem[] = [];
+    
+    // 先处理已有的文件
+    skippedHistoricalDuplicates.forEach(file => {
+      if (file.path && !histFilePaths.has(file.path)) {
+        histFilePaths.add(file.path);
+        uniqueHistoricalDuplicates.push(file);
+      }
+    });
+    
+    // 再处理从deduplicator获取的文件
+    deduplicator.getSkippedHistoricalDuplicates().forEach(file => {
+      if (file.path && !histFilePaths.has(file.path)) {
+        histFilePaths.add(file.path);
+        uniqueHistoricalDuplicates.push(file);
+      }
+    });
+    
+    // 清空原列表并添加去重后的文件
+    skippedHistoricalDuplicates.length = 0;
+    skippedHistoricalDuplicates.push(...uniqueHistoricalDuplicates);
+    
+    // 对任务内重复文件也进行同样处理
+    const taskFilePaths = new Set<string>();
+    const uniqueTaskDuplicates: FileItem[] = [];
+    
+    skippedTaskDuplicates.forEach(file => {
+      if (file.path && !taskFilePaths.has(file.path)) {
+        taskFilePaths.add(file.path);
+        uniqueTaskDuplicates.push(file);
+      }
+    });
+    
+    deduplicator.getSkippedTaskDuplicates().forEach(file => {
+      if (file.path && !taskFilePaths.has(file.path)) {
+        taskFilePaths.add(file.path);
+        uniqueTaskDuplicates.push(file);
+      }
+    });
+    
+    // 清空原列表并添加去重后的文件
+    skippedTaskDuplicates.length = 0;
+    skippedTaskDuplicates.push(...uniqueTaskDuplicates);
     
     // 设置成功标志（如果有失败项，则为false）
     result.success = failedItems.length === 0;
@@ -830,17 +874,60 @@ export async function scanAndTransport(config: ScanAndTransportConfig): Promise<
         await logToFile(logFilePath, `处理打包: ${files.length} 个文件`);
         
         try {
-          // 这里添加实际的打包逻辑
-          // 由于我们没有看到完整的打包逻辑，暂时添加一个简单的模拟处理
-          await logToFile(logFilePath, `模拟打包处理...`);
+          // 创建临时输出目录
+          const packageName = `package-${taskId || 'default'}-${scanId}-${packagePaths.length}.zip`;
+          const packagePath = path.join(outputDir, packageName);
           
-          // 将处理后的文件添加到传输队列
-          files.forEach(file => {
-            queue.markAsCompleted(file.path);
-            queue.addToQueue('transport', file);
+          // 调用core/packaging.ts中的createBatchPackage函数创建包
+          await logToFile(logFilePath, `正在创建打包文件: ${packagePath}`);
+          const { createBatchPackage } = require('./core/packaging');
+          
+          const packageResult = await createBatchPackage(files, packagePath, {
+            includeMetadata: true,
+            compressionLevel: 0,
+            tempDir: path.join(outputDir, 'temp')
           });
           
-          await logToFile(logFilePath, `文件成功添加到传输队列`);
+          if (packageResult.success) {
+            // 记录包路径
+            packagePaths.push(packagePath);
+            await logToFile(logFilePath, `打包成功: ${packagePath}`);
+            
+            // 添加打包后的文件到传输队列
+            const packageItem: FileItem = {
+              path: packagePath,
+              name: path.basename(packagePath),
+              createTime: new Date(),
+              modifyTime: new Date(),
+              size: fs.statSync(packagePath).size,
+              origin: 'filesystem',
+              metadata: {
+                packagedFiles: files.map(f => f.path),
+                fileCount: files.length
+              }
+            };
+            
+            // 将打包文件添加到传输队列
+            queue.addToQueue('transport', packageItem);
+            
+            // 标记原始文件为已完成
+            files.forEach(file => {
+              queue.markAsCompleted(file.path);
+            });
+            
+            await logToFile(logFilePath, `打包文件已添加到传输队列: ${packageItem.path}`);
+          } else {
+            // 打包失败处理
+            await logToFile(logFilePath, `打包失败: ${packageResult.error?.message || '未知错误'}`);
+            files.forEach(file => {
+              failedItems.push({
+                type: 'packaging' as const,
+                path: file.path,
+                error: `打包失败: ${packageResult.error?.message || '未知错误'}`
+              });
+              queue.markAsFailed(file.path);
+            });
+          }
         } catch (error: any) {
           await logToFile(logFilePath, `打包处理失败: ${error.message}`);
           files.forEach(file => {
