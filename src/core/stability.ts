@@ -217,25 +217,33 @@ export async function waitForFileStability(
   let consecutiveStableChecks = 0;
   const requiredStableChecks = 2; // 连续稳定检查次数，确保文件真的稳定
   
+  console.log(`[稳定性检查] 开始检查文件 ${filePath}, 最大重试次数: ${opts.maxRetries}, 间隔: ${opts.retryInterval}ms`);
+  
   while (retries < opts.maxRetries) {
     const status = await checkFileStability(filePath, opts);
+    console.log(`[稳定性检查] 文件 ${filePath} 的第 ${retries + 1}/${opts.maxRetries} 次检查结果: ${status}`);
     
     if (status === FileStabilityStatus.STABLE) {
       consecutiveStableChecks++;
+      console.log(`[稳定性检查] 文件 ${filePath} 连续稳定次数: ${consecutiveStableChecks}/${requiredStableChecks}`);
       
       if (consecutiveStableChecks >= requiredStableChecks) {
+        console.log(`[稳定性检查] 文件 ${filePath} 已稳定，通过连续 ${consecutiveStableChecks} 次检查`);
         return true; // 文件已稳定
       }
     } else {
       // 重置连续稳定计数
+      console.log(`[稳定性检查] 文件 ${filePath} 不稳定，重置连续稳定计数，状态: ${status}`);
       consecutiveStableChecks = 0;
     }
     
     // 等待一段时间后重试
+    console.log(`[稳定性检查] 等待 ${opts.retryInterval}ms 后进行下一次检查`);
     await new Promise(resolve => setTimeout(resolve, opts.retryInterval));
     retries++;
   }
   
+  console.log(`[稳定性检查] 文件 ${filePath} 仍不稳定，已达到最大重试次数 ${opts.maxRetries}`);
   return false; // 文件仍不稳定
 }
 

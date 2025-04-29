@@ -4,6 +4,7 @@
 
 import { FileItem, MatchRule, ScanProgress, FailureItem, TransportOptions as CoreTransportOptions } from './index';
 import { QueueConfig, StabilityConfig } from './queue';
+import { DeduplicatorOptions } from './deduplication';
 
 /** 定义简化版的 Transport 配置接口 (仅移除 retryCount, timeout, debug, packageSize) */
 export type ScanAndTransportTransportConfig = Omit<CoreTransportOptions, 'retryCount' | 'timeout' | 'debug' | 'packageSize'> & {
@@ -61,6 +62,8 @@ export interface ScanAndTransportConfig {
   calculateMd5?: boolean;
   /** 结果文件存储目录 (默认: './results') */
   resultsDir?: string;
+  /** 去重配置选项 */
+  deduplicatorOptions?: Partial<DeduplicatorOptions>;
 }
 
 /** 定义 scanAndTransport 返回结果接口 */
@@ -80,6 +83,10 @@ export interface ScanAndTransportResult {
     remotePath: string;
     error?: string;
   }[];
+  /** 因与历史任务重复而跳过的文件列表 */
+  skippedHistoricalDuplicates: FileItem[];
+  /** 因任务内重复而跳过的文件列表 */
+  skippedTaskDuplicates: FileItem[];
   /** 实际使用的日志文件路径 */
   logFilePath: string;
   /** 任务唯一标识符 */

@@ -275,9 +275,13 @@ export async function extractArchiveContents(
   // 合并选项
   const opts = { ...DEFAULT_EXTRACTION_OPTIONS, ...options };
   
+  console.log(`[归档提取] 开始提取压缩文件: ${archivePath} 到 ${outputPath}`);
+  console.log(`[归档提取] 选项: skipLargeFiles=${opts.skipLargeFiles}, largeFileThreshold=${opts.largeFileThreshold}`);
+  
   try {
     // 确保文件存在
     if (!await fs.pathExists(archivePath)) {
+      console.log(`[归档提取] 错误: 找不到文件 ${archivePath}`);
       return {
         success: false,
         extractedPath: outputPath,
@@ -288,20 +292,27 @@ export async function extractArchiveContents(
     
     // 确保输出目录存在
     await fs.ensureDir(outputPath);
+    console.log(`[归档提取] 确保输出目录存在: ${outputPath}`);
     
     // 获取文件扩展名
     const ext = path.extname(archivePath).toLowerCase();
+    console.log(`[归档提取] 检测到文件类型: ${ext}`);
     
     // 根据文件类型选择合适的提取方法
     if (ext === '.zip') {
+      console.log(`[归档提取] 使用ZIP提取器处理文件: ${archivePath}`);
       return await extractZipArchive(archivePath, outputPath, opts);
     } else if (ext === '.tar') {
+      console.log(`[归档提取] 使用TAR提取器处理文件: ${archivePath}`);
       return await extractTarArchive(archivePath, outputPath, opts);
     } else if (ext === '.tgz' || archivePath.toLowerCase().endsWith('.tar.gz')) {
+      console.log(`[归档提取] 使用TGZ提取器处理文件: ${archivePath}`);
       return await extractTgzArchive(archivePath, outputPath, opts);
     } else if (ext === '.rar') {
+      console.log(`[归档提取] 使用RAR提取器处理文件: ${archivePath}`);
       return await extractRarArchive(archivePath, outputPath, opts);
     } else {
+      console.log(`[归档提取] 错误: 不支持的压缩格式 ${ext}`);
       return {
         success: false,
         extractedPath: outputPath,
@@ -311,6 +322,8 @@ export async function extractArchiveContents(
     }
   } catch (error) {
     // 提取过程出错
+    console.log(`[归档提取] 提取过程中发生未捕获错误: ${error instanceof Error ? error.message : String(error)}`);
+    console.log(`[归档提取] 错误堆栈: ${error instanceof Error ? error.stack : '无堆栈信息'}`);
     return {
       success: false,
       extractedPath: outputPath,
@@ -329,16 +342,34 @@ async function extractZipArchive(
   options: ArchiveExtractionOptions
 ): Promise<ArchiveExtractionResult> {
   try {
+    console.log(`[ZIP提取] 开始解压ZIP文件: ${zipPath}`);
+    
+    // 获取压缩文件大小
+    try {
+      const stats = await fs.stat(zipPath);
+      console.log(`[ZIP提取] 文件大小: ${stats.size} 字节`);
+    } catch (statError) {
+      console.log(`[ZIP提取] 无法获取文件大小: ${statError instanceof Error ? statError.message : String(statError)}`);
+    }
+    
     await zip.uncompress(zipPath, outputPath);
+    console.log(`[ZIP提取] 解压完成，开始读取提取的文件列表`);
     
     // 读取提取的文件列表
     const extractedFiles = await getExtractedFilesList(outputPath);
+    console.log(`[ZIP提取] 提取了 ${extractedFiles.length} 个文件`);
     
     // 检查并处理大文件
+    console.log(`[ZIP提取] 检查大文件，阈值: ${options.largeFileThreshold} 字节, 跳过大文件: ${options.skipLargeFiles}`);
     const skippedLargeFiles = options.skipLargeFiles ? 
       await checkAndHandleLargeFiles(outputPath, options.largeFileThreshold || 100 * 1024 * 1024) : 
       [];
     
+    if (skippedLargeFiles.length > 0) {
+      console.log(`[ZIP提取] 跳过了 ${skippedLargeFiles.length} 个大文件`);
+    }
+    
+    console.log(`[ZIP提取] 解压成功: ${zipPath}`);
     return {
       success: true,
       extractedPath: outputPath,
@@ -346,6 +377,8 @@ async function extractZipArchive(
       skippedLargeFiles: skippedLargeFiles.length > 0 ? skippedLargeFiles : undefined
     };
   } catch (error) {
+    console.log(`[ZIP提取] 解压失败: ${error instanceof Error ? error.message : String(error)}`);
+    console.log(`[ZIP提取] 错误堆栈: ${error instanceof Error ? error.stack : '无堆栈信息'}`);
     throw new Error(`提取ZIP文件失败: ${error instanceof Error ? error.message : String(error)}`);
   }
 }

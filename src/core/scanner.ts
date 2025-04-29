@@ -89,7 +89,14 @@ export async function scanFiles(options: ScanOptions): Promise<ScanResult> {
     const relativePath = path.relative(rootDir, dirPath);
     if (!relativePath) return false;
     const normalizedPath = path.normalize(relativePath).toLowerCase();
+    
     return normalizedSkipDirs.some((skipDir) => {
+      // 处理绝对路径的情况
+      if (path.isAbsolute(skipDir) && dirPath.toLowerCase() === skipDir.toLowerCase()) {
+        return true;
+      }
+      
+      // 处理相对路径的情况
       if (normalizedPath === skipDir) return true;
       if (normalizedPath.startsWith(skipDir + path.sep)) return true;
       return false;
