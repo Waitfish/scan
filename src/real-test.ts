@@ -4,7 +4,7 @@
 
 import * as path from 'path';
 import * as fs from 'fs-extra';
-// import * as compressing from 'compressing'; // 暂时移除压缩包测试以简化
+import * as compressing from 'compressing'; // 重新启用压缩包测试
 import { scanAndTransport } from './facade';
 import { MatchRule } from './types';
 import { ScanAndTransportConfig } from './types/facade-v2';
@@ -94,9 +94,31 @@ async function createIndependentTestDirectories(
       console.log(`  - 完成根目录创建: ${rootDir}`);
     }
 
-    // --- 暂时移除压缩文件创建 --- 
-    // console.log('跳过压缩文件创建以简化测试...');
-
+    // --- 创建压缩文件用例 --- 
+    console.log('创建压缩文件测试用例...');
+    
+    // 在source1中创建一个测试压缩包
+    const zipTestDir = path.join(testRootDir1, 'zip-test');
+    await fs.ensureDir(zipTestDir);
+    
+    // 创建要打包的文件
+    await fs.writeFile(path.join(zipTestDir, 'inside-archive.docx'), 'MeiTuan content inside archive');
+    await fs.writeFile(path.join(zipTestDir, 'inside-archive.pdf'), 'BuYunSou data inside archive');
+    await fs.writeFile(path.join(zipTestDir, 'not-matched.txt'), 'This file should not be matched');
+    
+    // 创建压缩包
+    const zipFilePath = path.join(testRootDir1, 'test-archive.zip');
+    await compressing.zip.compressDir(zipTestDir, zipFilePath);
+    console.log(`  - 创建测试压缩包: ${zipFilePath}`);
+    
+    // 创建一个与匹配规则相符的压缩包文件名（测试压缩包自身被匹配的情况）
+    const matchedZipFilePath = path.join(testRootDir2, 'BuYunSou-archive.zip');
+    await compressing.zip.compressDir(zipTestDir, matchedZipFilePath);
+    console.log(`  - 创建匹配规则的压缩包: ${matchedZipFilePath}`);
+    
+    // 清理临时目录
+    await fs.remove(zipTestDir);
+    
     console.log('所有测试目录和文件创建完成。');
 
   } catch (error) {
@@ -130,12 +152,13 @@ async function main(): Promise<void> {
       cleanDir
     );
 
-    // 匹配规则 (保持不变)
+    // 匹配规则 (更新匹配规则以便同时匹配压缩包文件和内部文件)
     const rules: MatchRule[] = [
       [['mjs'], 'clean.*'], 
-      [['docx', 'doc'], '^MeiTuan.*|unique-file.*|shared-content-a.*|shared-content-a-altname.*'], // 调整规则以匹配新文件名
-      [['pdf', 'xls'], '^BuYunSou.*|unique-data.*|shared-name.*|nested-data.*|shared-content-b.*'], // 调整规则以匹配新文件名
-      [['jpg'], '.*\.jpg$'] // 确保只匹配jpg
+      [['docx', 'doc'], '^MeiTuan.*|unique-file.*|shared-content-a.*|shared-content-a-altname.*|inside-archive.*'], // 添加inside-archive.*匹配压缩包内文件
+      [['pdf', 'xls'], '^BuYunSou.*|unique-data.*|shared-name.*|nested-data.*|shared-content-b.*|inside-archive.*'], // 能匹配BuYunSou-archive.zip和内部pdf
+      [['jpg'], '.*\.jpg$'], // 确保只匹配jpg
+      [['zip'], 'BuYunSou-archive\.zip|test-archive\.zip'] // 同时匹配两个压缩包文件本身
     ];
     
     // 定义扫描和传输配置
@@ -149,7 +172,7 @@ async function main(): Promise<void> {
       // skipDirs 保持相对路径或绝对路径。outputDir 现在在外面，也添加到 skip 列表。
       skipDirs: ['node_modules', '.git', outputDir], // 确保 outputDir 被跳过
       depth: -1, // 无限深度
-      scanNestedArchives: false, // 暂时禁用嵌套扫描，因为没创建压缩包
+      scanNestedArchives: true, // 启用嵌套扫描以测试压缩包内文件
       calculateMd5: true,
       packagingTrigger: {
         maxFiles: 10,  // 调小打包数量以便更快看到多个包
@@ -174,7 +197,7 @@ async function main(): Promise<void> {
       },
       onProgress: (progress, file) => {
         if (file) {
-          console.log(`处理文件: ${file.name}`); 
+          console.log(`处理文件: ${file.name} (origin: ${file.origin})`); // 添加origin信息到日志
         } else {
           // 显示绝对路径以避免混淆
           console.log(`\n正在扫描目录: ${progress.currentDir}`);
@@ -183,14 +206,13 @@ async function main(): Promise<void> {
           console.log(`  - 匹配文件数: ${progress.matchedFiles} 个`);
           console.log(`  - 已扫描目录数: ${progress.scannedDirs} 个`);
           console.log(`  - 已跳过目录数: ${progress.skippedDirs} 个`);
-          // console.log(`  - 已处理压缩包数: ${progress.archivesScanned} 个`); // 移除压缩包相关日志
-          // console.log(`  - 已处理嵌套压缩包数: ${progress.nestedArchivesScanned || 0} 个`);
+          console.log(`  - 已处理压缩包数: ${progress.archivesScanned || 0} 个`); // 恢复压缩包相关日志
+          console.log(`  - 已处理嵌套压缩包数: ${progress.nestedArchivesScanned || 0} 个`);
           console.log(`  - 已忽略大文件数: ${progress.ignoredLargeFiles} 个`);
-          // if (progress.currentNestedLevel && progress.currentNestedLevel > 0) { // 移除压缩包相关日志
-          //   console.log(`  - 当前压缩包嵌套层级: ${progress.currentNestedLevel}`);
-          // }
+          if (progress.currentNestedLevel && progress.currentNestedLevel > 0) {
+            console.log(`  - 当前压缩包嵌套层级: ${progress.currentNestedLevel}`);
+          }
         }
-
       }
     };
 
@@ -262,6 +284,19 @@ async function main(): Promise<void> {
         console.log(`  MD5: ${file.md5}`);
       });
     }
+
+    // 输出匹配的文件及其origin
+    console.log('\n匹配的文件详情:');
+    result.processedFiles.forEach((file, index) => {
+      console.log(`[${index + 1}] ${file.name}`);
+      console.log(`  路径: ${file.path}`);
+      console.log(`  来源: ${file.origin}`); // filesystem或archive
+      if (file.origin === 'archive') {
+        console.log(`  压缩包路径: ${file.archivePath}`);
+        console.log(`  内部路径: ${file.internalPath}`);
+        console.log(`  嵌套层级: ${file.nestedLevel}`);
+      }
+    });
 
     // 输出失败项
     if (result.failedItems.length > 0) {

@@ -769,6 +769,60 @@ export async function scanAndTransport(config: ScanAndTransportConfig): Promise<
                   if (extractResult.skippedLargeFiles && extractResult.skippedLargeFiles.length > 0) {
                     await logToFile(logFilePath, `跳过了 ${extractResult.skippedLargeFiles.length} 个大文件: ${extractResult.skippedLargeFiles.join(', ')}`);
                   }
+
+                  // 新增代码：处理压缩包内匹配的文件，将它们作为独立文件添加到MD5队列
+                  await logToFile(logFilePath, `开始处理压缩包内匹配的文件`);
+                  
+                  // 获取匹配队列中所有已匹配的内部文件
+                  const matchedInternalFiles = matchedFiles.filter(
+                    mf => mf.origin === 'archive' && mf.archivePath === file.path
+                  );
+                  
+                  if (matchedInternalFiles.length > 0) {
+                    await logToFile(logFilePath, `在匹配队列中找到 ${matchedInternalFiles.length} 个来自该压缩包的匹配文件`);
+                    
+                    // 将这些内部文件添加到MD5队列
+                    for (const internalFile of matchedInternalFiles) {
+                      // 构建内部文件在解压目录中的路径
+                      const extractedFilePath = path.join(tempOutputDir, internalFile.internalPath || '');
+                      
+                      // 检查提取的文件是否存在
+                      if (await fs.pathExists(extractedFilePath)) {
+                        // 获取文件统计信息
+                        const internalStats = await fs.stat(extractedFilePath);
+                        
+                        // 更新或创建独立的FileItem对象
+                        const internalFileItem: FileItem = {
+                          ...internalFile,
+                          // 更新路径为解压后的路径
+                          path: extractedFilePath,
+                          // 更新大小信息
+                          size: internalStats.size,
+                          // 确保有metadata对象
+                          metadata: {
+                            ...(internalFile.metadata || {}),
+                            extractedFromArchive: file.path,
+                            originalPath: internalFile.path,
+                            mtime: internalStats.mtime.toISOString()
+                          }
+                        };
+                        
+                        // 将内部文件添加到MD5队列
+                        queue.addToQueue('md5', internalFileItem);
+                        await logToFile(logFilePath, `将压缩包内文件添加到MD5队列: ${internalFile.name} (来自 ${file.path})`);
+                      } else {
+                        await logToFile(logFilePath, `警告: 压缩包内匹配的文件在解压目录中未找到: ${extractedFilePath}`);
+                        failedItems.push({
+                          type: 'archiveEntry' as const,
+                          path: file.path,
+                          entryPath: internalFile.internalPath || '',
+                          error: `无法找到解压后的文件: ${extractedFilePath}`
+                        });
+                      }
+                    }
+                  } else {
+                    await logToFile(logFilePath, `在匹配队列中未找到来自该压缩包的匹配文件`);
+                  }
                 } else {
                   await logToFile(logFilePath, `压缩文件提取部分成功: ${file.path}, 错误: ${extractResult.error?.message}`);
                 }
@@ -781,9 +835,22 @@ export async function scanAndTransport(config: ScanAndTransportConfig): Promise<
                   file.metadata.skippedLargeFiles = extractResult.skippedLargeFiles;
                 }
                 
-                // 将文件标记为已完成处理并添加到MD5队列
-                queue.markAsCompleted(file.path);
-                queue.addToQueue('md5', file);
+                // 将压缩包本身也添加到MD5队列（如果它匹配规则）
+                const isArchiveMatched = matchedFiles.some(
+                  mf => mf.origin === 'filesystem' && mf.path === file.path
+                );
+                
+                if (isArchiveMatched) {
+                  // 将文件标记为已完成处理并添加到MD5队列
+                  queue.markAsCompleted(file.path);
+                  queue.addToQueue('md5', file);
+                  await logToFile(logFilePath, `压缩包自身已匹配规则，添加到MD5队列: ${file.path}`);
+                } else {
+                  // 仅标记为已完成处理但不添加到MD5队列
+                  queue.markAsCompleted(file.path);
+                  await logToFile(logFilePath, `压缩包自身未匹配规则，仅标记为已处理: ${file.path}`);
+                }
+                
                 await logToFile(logFilePath, `压缩文件稳定性检测和提取完成: ${file.path} (大小: ${stats.size} 字节)`);
               } catch (error: any) {
                 await logToFile(logFilePath, `压缩文件提取失败: ${file.path}, 错误: ${error.message}`);
