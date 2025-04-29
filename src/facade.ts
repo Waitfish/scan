@@ -123,7 +123,31 @@ export async function scanAndTransport(config: ScanAndTransportConfig): Promise<
   // 记录开始时间
   const startTime = new Date();
   
+  // 添加各阶段耗时记录
+  const stageTimings: Record<string, number> = {
+    initialization: 0,
+    scanning: 0,
+    fileStabilityCheck: 0,
+    archiveStabilityCheck: 0,
+    md5Calculation: 0,
+    packaging: 0,
+    transport: 0,
+    finalization: 0
+  };
+  
+  // 添加计时辅助函数
+  const timeStage = async (
+    stageName: string, 
+    callback: () => Promise<void>
+  ): Promise<void> => {
+    const stageStart = Date.now();
+    await callback();
+    stageTimings[stageName] = Date.now() - stageStart;
+  };
+  
   // 1. 合并配置与默认值
+  const initStart = Date.now();
+  
   const taskId = config.taskId || crypto.randomUUID(); // 使用提供的任务ID或生成新的
   const scanId = `scan_${startTime.getTime()}`; // 基于时间戳创建扫描ID
   
@@ -219,9 +243,16 @@ export async function scanAndTransport(config: ScanAndTransportConfig): Promise<
     elapsedTimeMs: 0 // 临时值
   };
   
+  // 更新初始化阶段耗时
+  stageTimings.initialization = Date.now() - initStart;
+  await logToFile(logFilePath, `初始化阶段耗时: ${stageTimings.initialization}ms`);
+  
   let totalMatchedFiles = 0; // 用于跟踪所有根目录的总匹配文件数
 
   try {
+    // 7. 循环处理每个根目录 - 计时扫描阶段
+    const scanStart = Date.now();
+    
     // 7. 循环处理每个根目录
     for (const currentRootDir of rootDirs) {
       await logToFile(logFilePath, `开始扫描根目录: ${currentRootDir}`);
@@ -277,36 +308,50 @@ export async function scanAndTransport(config: ScanAndTransportConfig): Promise<
     await logToFile(logFilePath, `所有根目录扫描完成，共找到 ${totalMatchedFiles} 个匹配文件`);
     await logToFile(logFilePath, `处理扫描队列...`);
     
+    // 更新扫描阶段耗时
+    stageTimings.scanning = Date.now() - scanStart;
+    await logToFile(logFilePath, `扫描阶段耗时: ${stageTimings.scanning}ms`);
+    
     // 9. 处理匹配队列 (现在包含所有根目录的文件)
     queue.processMatchedQueue();
     
-    // 10. 处理文件稳定性队列
+    // 10. 处理文件稳定性队列 - 计时文件稳定性检查阶段
     await logToFile(logFilePath, `开始处理文件稳定性队列...`);
-    await processFileStabilityQueue();
-    await logToFile(logFilePath, `文件稳定性队列处理完成`);
+    await timeStage('fileStabilityCheck', async () => {
+      await processFileStabilityQueue();
+    });
+    await logToFile(logFilePath, `文件稳定性队列处理完成，耗时: ${stageTimings.fileStabilityCheck}ms`);
     
-    // 11. 处理压缩文件稳定性检测队列
+    // 11. 处理压缩文件稳定性检测队列 - 计时压缩文件稳定性检查阶段
     await logToFile(logFilePath, `开始处理压缩文件稳定性队列...`);
-    await processArchiveStabilityQueue();
-    await logToFile(logFilePath, `压缩文件稳定性队列处理完成`);
+    await timeStage('archiveStabilityCheck', async () => {
+      await processArchiveStabilityQueue();
+    });
+    await logToFile(logFilePath, `压缩文件稳定性队列处理完成，耗时: ${stageTimings.archiveStabilityCheck}ms`);
     
-    // 12. 处理MD5计算队列
+    // 12. 处理MD5计算队列 - 计时MD5计算阶段
     await logToFile(logFilePath, `开始处理MD5计算队列...`);
-    await processMd5Queue();
-    await logToFile(logFilePath, `MD5计算队列处理初步完成`);
+    await timeStage('md5Calculation', async () => {
+      await processMd5Queue();
+    });
+    await logToFile(logFilePath, `MD5计算队列处理完成，耗时: ${stageTimings.md5Calculation}ms`);
 
     // 获取打包队列长度
     const packagingQueueLength = queue.getFilesInQueue('packaging').length;
     await logToFile(logFilePath, `准备处理打包队列，初始队列长度: ${packagingQueueLength}`);
     
-    // 13. 处理打包队列
-    await processPackagingQueue();
-    await logToFile(logFilePath, `打包队列处理完成 (函数已返回)`);
+    // 13. 处理打包队列 - 计时打包阶段
+    await timeStage('packaging', async () => {
+      await processPackagingQueue();
+    });
+    await logToFile(logFilePath, `打包队列处理完成，耗时: ${stageTimings.packaging}ms`);
     
-    // 14. 处理传输队列
+    // 14. 处理传输队列 - 计时传输阶段
     await logToFile(logFilePath, `开始处理传输队列...`);
-    await processTransportQueue();
-    await logToFile(logFilePath, `传输队列处理完成`);
+    await timeStage('transport', async () => {
+      await processTransportQueue();
+    });
+    await logToFile(logFilePath, `传输队列处理完成，耗时: ${stageTimings.transport}ms`);
     
     // 15. 处理重试队列中的文件
     await logToFile(logFilePath, `开始处理重试队列...`);
@@ -387,6 +432,9 @@ export async function scanAndTransport(config: ScanAndTransportConfig): Promise<
     await logToFile(logFilePath, `错误: ${error.message || String(error)}`);
     console.error('Error during scanAndTransport:', error);
   } finally {
+    // 记录结束时间 - 计时收尾阶段
+    const finalizationStart = Date.now();
+    
     // 记录结束时间
     const endTime = new Date();
     const elapsedTimeMs = endTime.getTime() - startTime.getTime();
@@ -401,6 +449,9 @@ export async function scanAndTransport(config: ScanAndTransportConfig): Promise<
     result.endTime = endTime;
     result.elapsedTimeMs = elapsedTimeMs;
     
+    // 添加阶段耗时到结果对象 (扩展ScanAndTransportResult类型)
+    (result as any).stageTimings = stageTimings;
+    
     // 记录结束信息到日志
     await logToFile(logFilePath, `--- ScanAndTransport End ---`);
     await logToFile(logFilePath, `结束时间: ${endTime.toISOString()}`);
@@ -411,6 +462,27 @@ export async function scanAndTransport(config: ScanAndTransportConfig): Promise<
     await logToFile(logFilePath, `包数量: ${packagePaths.length}`);
     await logToFile(logFilePath, `历史去重跳过文件数: ${skippedHistoricalDuplicates.length}`);
     await logToFile(logFilePath, `任务内去重跳过文件数: ${skippedTaskDuplicates.length}`);
+    
+    // 添加各阶段耗时统计信息到日志
+    stageTimings.finalization = Date.now() - finalizationStart;
+    await logToFile(logFilePath, `\n--- 各阶段耗时统计 ---`);
+    await logToFile(logFilePath, `初始化阶段: ${stageTimings.initialization}ms (${(stageTimings.initialization / elapsedTimeMs * 100).toFixed(2)}%)`);
+    await logToFile(logFilePath, `扫描阶段: ${stageTimings.scanning}ms (${(stageTimings.scanning / elapsedTimeMs * 100).toFixed(2)}%)`);
+    await logToFile(logFilePath, `文件稳定性检查阶段: ${stageTimings.fileStabilityCheck}ms (${(stageTimings.fileStabilityCheck / elapsedTimeMs * 100).toFixed(2)}%)`);
+    await logToFile(logFilePath, `压缩文件稳定性检查阶段: ${stageTimings.archiveStabilityCheck}ms (${(stageTimings.archiveStabilityCheck / elapsedTimeMs * 100).toFixed(2)}%)`);
+    await logToFile(logFilePath, `MD5计算阶段: ${stageTimings.md5Calculation}ms (${(stageTimings.md5Calculation / elapsedTimeMs * 100).toFixed(2)}%)`);
+    await logToFile(logFilePath, `打包阶段: ${stageTimings.packaging}ms (${(stageTimings.packaging / elapsedTimeMs * 100).toFixed(2)}%)`);
+    await logToFile(logFilePath, `传输阶段: ${stageTimings.transport}ms (${(stageTimings.transport / elapsedTimeMs * 100).toFixed(2)}%)`);
+    await logToFile(logFilePath, `收尾阶段: ${stageTimings.finalization}ms (${(stageTimings.finalization / elapsedTimeMs * 100).toFixed(2)}%)`);
+    
+    // 可视化百分比 (简单的文本条形图)
+    await logToFile(logFilePath, `\n--- 阶段耗时百分比可视化 ---`);
+    for (const [stage, time] of Object.entries(stageTimings)) {
+      const percent = (time / elapsedTimeMs * 100).toFixed(2);
+      const barLength = Math.max(1, Math.round(Number(percent) / 2)); // 每2%显示一个字符
+      const bar = '#'.repeat(barLength);
+      await logToFile(logFilePath, `${stage.padEnd(25)}: ${bar.padEnd(50)} ${percent}%`);
+    }
     
     // 保存去重历史记录
     try {

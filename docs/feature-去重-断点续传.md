@@ -187,8 +187,6 @@ export interface TaskState {
   scanState: {
     /** 已完成扫描的目录列表 (可选，如果恢复粒度需要到目录级别) */
     completedDirs?: string[];
-    /** 下一个待扫描的目录 (可选，更精细的恢复点) */
-    nextDirToScan?: string;
     /** 已匹配但尚未进入任何处理队列的文件列表 */
     pendingMatchedFiles: FileItem[];
   };
@@ -261,7 +259,7 @@ export interface TaskState {
 ## 2. 状态持久化与恢复机制 (概要)
 
 1.  **状态文件**:
-    *   为每个任务（由 `taskId` 标识）创建一个状态文件，例如 `task-state-${taskId}.json`。
+    *   为每个任务（由 `taskId` 标识）创建一个状态文件，例如 `task-state-${taskId}-${scanId}.json`。
     *   状态文件存储在 `resultsDir` 或一个专门的 `state` 目录下。
 2.  **保存时机**:
     *   **关键节点**: 在 `scanAndTransport` 函数的主要步骤之间（例如，扫描后、MD5计算后、打包后、传输后）。
@@ -314,6 +312,3 @@ export interface TaskState {
 
 这些测试需要结合 Mocking 技术（例如 Mock 文件系统操作 `fs-extra`，Mock 队列处理逻辑）来隔离测试单元并模拟中断场景。
 
----
-
-请您审阅以上方案。如果方案可行，我将开始着手准备具体的代码实现，包括定义 `state.d.ts` 文件、实现状态的保存和加载逻辑，并将其集成到 `scanAndTransport` 函数中。
