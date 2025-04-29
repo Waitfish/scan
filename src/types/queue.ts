@@ -14,6 +14,8 @@ export interface QueueConfig {
   maxConcurrentArchiveChecks?: number;
   /** 最大并发MD5计算数量 (默认: 5) */
   maxConcurrentMd5?: number;
+  /** 最大并发打包数量 (默认: 10) */
+  maxConcurrentPackaging?: number;
   /** 最大并发传输数量 (默认: 2) */
   maxConcurrentTransfers?: number;
   /** 稳定性检测重试延迟（毫秒）(默认: 2000) */

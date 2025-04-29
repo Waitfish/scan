@@ -152,7 +152,7 @@ async function main(): Promise<void> {
       scanNestedArchives: false, // 暂时禁用嵌套扫描，因为没创建压缩包
       calculateMd5: true,
       packagingTrigger: {
-        maxFiles: 4,  // 调小打包数量以便更快看到多个包
+        maxFiles: 10,  // 调小打包数量以便更快看到多个包
         maxSizeMB: 10
       },
       transport: {
@@ -190,6 +190,7 @@ async function main(): Promise<void> {
           //   console.log(`  - 当前压缩包嵌套层级: ${progress.currentNestedLevel}`);
           // }
         }
+
       }
     };
 

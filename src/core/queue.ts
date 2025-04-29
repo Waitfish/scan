@@ -576,6 +576,8 @@ export class FileProcessingQueue {
         return this.queueConfig.maxConcurrentArchiveChecks || 3;
       case 'md5':
         return this.queueConfig.maxConcurrentMd5 || 5;
+      case 'packaging':
+        return this.queueConfig.maxConcurrentPackaging || 10;
       case 'transport':
         return this.queueConfig.maxConcurrentTransfers || 2;
       default:
