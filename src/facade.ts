@@ -40,7 +40,7 @@ const DEFAULT_MAX_FILE_SIZE = 500 * 1024 * 1024; // 500 MB
 const DEFAULT_SKIP_DIRS: string[] = [];
 const DEFAULT_DEPTH = -1;
 const DEFAULT_SCAN_NESTED_ARCHIVES = true;
-const DEFAULT_MAX_NESTED_LEVEL = 5;
+const DEFAULT_MAX_NESTED_LEVEL = 10;
 const DEFAULT_PACKAGING_TRIGGER: PackagingTriggerOptions = { maxFiles: 500, maxSizeMB: 2048 };
 const DEFAULT_STABILITY_CONFIG: StabilityConfig = {
   base: {
@@ -177,7 +177,9 @@ export async function scanAndTransport(config: ScanAndTransportConfig): Promise<
   // 2. 准备队列配置
   const queueConfig: QueueConfig = {
     ...DEFAULT_QUEUE_CONFIG,
-    ...config.queue
+    ...config.queue,
+    // 确保打包并发数与打包触发器的maxFiles配置保持一致
+    maxConcurrentPackaging: config.packagingTrigger?.maxFiles || DEFAULT_PACKAGING_TRIGGER.maxFiles
   };
   
   // 3. 准备稳定性配置
@@ -1033,14 +1035,14 @@ export async function scanAndTransport(config: ScanAndTransportConfig): Promise<
         if (queue.getFilesInQueue('packaging').length > 0 || 
             queue.getDetailedQueueStats().packaging.processing > 0) {
           // 继续处理下一批
-          queue.processNextBatch('packaging', packagingTrigger.maxFiles || 10, processor);
+          queue.processNextBatch('packaging', queueConfig.maxConcurrentPackaging || packagingTrigger.maxFiles || 10, processor);
         } else {
           resolve();
         }
       };
       
       // 开始处理第一批
-      queue.processNextBatch('packaging', packagingTrigger.maxFiles || 10, processor);
+      queue.processNextBatch('packaging', queueConfig.maxConcurrentPackaging || packagingTrigger.maxFiles || 10, processor);
     });
   }
   

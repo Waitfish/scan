@@ -78,47 +78,544 @@
 
 ## 3. 任务中断与恢复 (断点续传)
 
-**目标**: 使整个扫描、处理、上传流程具备在意外中断后，能够从上次的进度点恢复执行的能力，避免完全重头开始。
+**目标**: 使整个扫描、处理、上传流程具备在意外中断后，能够从上次的进度点恢复执行的能力，避免完全重头开始。这对处理大量文件时特别有价值，可以显著减少重复工作和总体执行时间。
 
-**实现方案 (高层次概念)**:
+### 3.1 系统设计
 
-1. **状态定义**: 明确需要持久化以支持恢复的关键状态信息。这可能包括：
-    * **扫描阶段**: 最后成功扫描的目录或文件的标记。
-    * **MD5 计算阶段**:
-        * 等待计算 MD5 的文件队列 (`md5Queue`) 的剩余内容。
-        * 已经完成 MD5 计算但尚未进入下一阶段的文件信息（包括 MD5 值）。
-        * `currentTaskMd5Set` 的内容（用于恢复任务内去重状态）。
-    * **打包阶段**:
-        * 等待打包的文件队列 (`packagingQueue`) 的剩余内容。
-        * 当前正在构建的包的状态（如果适用，例如已添加到包中的文件列表）。
-    * **上传阶段**:
-        * 等待上传的包队列 (`uploadQueue`) 的剩余内容。
-        * 已成功上传的包（或文件）的列表。
-    * **全局**: 任务的唯一标识符（用于关联状态文件），配置参数。
+断点续传功能由三个主要部分组成：
+1. **状态定义与存储**: 确定需要持久化的状态数据，以及如何在 JSON 文件中表示
+2. **状态保存机制**: 在任务执行的不同阶段定期保存状态
+3. **状态恢复逻辑**: 在任务启动时检测和恢复之前的状态
 
-2. **状态持久化**:
-    * 选择一种或多种方式存储状态，例如一个集中的 JSON 文件 (`task-state.json`) 或分布在不同阶段的状态文件。
-    * 状态更新时机：
-        * **定期保存**: 按一定时间间隔或处理完一定数量的项目后保存。
-        * **关键节点保存**: 在完成一个主要步骤（如一个目录扫描完、一个文件 MD5 计算完、一个包构建完/上传完）后保存。
-        * **原子性**: 状态保存操作应尽可能具有原子性，以防状态文件本身损坏。可以采用先写入临时文件再重命名的策略。
+#### 3.1.1 状态文件位置与命名
 
-3. **恢复逻辑**:
-    * **任务启动时**: 检查是否存在与当前任务（可能由配置参数或任务 ID 识别）相关的有效状态文件。
-    * **状态文件存在**:
-        * 加载并验证状态文件。
-        * 根据状态信息恢复各个内部队列、进度标记和 Set (如 `currentTaskMd5Set`)。
-        * 调整程序逻辑，使其从恢复的状态点开始执行，例如：跳过已扫描的目录，重新填充待处理队列，跳过已完成的 MD5 计算/打包/上传等。
-    * **状态文件不存在或无效**:
-        * 作为全新任务开始执行。
+状态文件将存储在配置的 `resultsDir` 目录下，命名格式为：
+```
+${resultsDir}/scan-state-${taskId}-${scanId}.json
+```
 
-4. **状态清理**:
-    * 当任务**正常成功完成**所有步骤后，应删除或标记关联的状态文件，以确保下次使用相同配置启动时是一个新任务。
+这样命名可以保证每个任务有唯一的状态文件，并且在多次运行相同任务ID的情况下，不同的 `scanId` 也能保持状态的隔离。
+
+### 3.2 接口定义
+
+为了支持断点续传，我们需要定义以下接口：
+
+```typescript
+// src/types/state.ts (新建文件)
+
+import { FileItem, FailureItem } from './index';
+import { TransportResult } from './transport';
+import { ScanAndTransportConfig } from './facade-v2';
+
+/**
+ * 表示任务的保存状态
+ */
+export interface TaskState {
+  /** 任务标识符 */
+  taskId: string;
+  
+  /** 扫描标识符 */
+  scanId: string;
+  
+  /** 状态版本号，用于未来兼容性 */
+  version: string;
+  
+  /** 任务开始时间 */
+  startTime: string;
+  
+  /** 最后保存时间 */
+  lastSavedTime: string;
+  
+  /** 配置快照（用于校验恢复的任务配置是否匹配） */
+  configSnapshot: {
+    rootDirs: string[];
+    rulesCount: number;
+    outputDir: string;
+    resultsDir: string;
+    deduplicationEnabled: boolean;
+    transportEnabled: boolean;
+  };
+  
+  /** 扫描阶段状态 */
+  scanState: {
+    /** 已处理完成的根目录 */
+    completedRootDirs: string[];
+    
+    /** 已扫描的目录 */
+    scannedDirs: string[];
+    
+    /** 已匹配但尚未进入处理队列的文件 */
+    pendingMatchedFiles: FileItem[];
+    
+    /** 扫描统计信息 */
+    stats: {
+      scannedFiles: number;
+      matchedFiles: number;
+      scannedDirs: number;
+      skippedDirs: number;
+      ignoredLargeFiles: number;
+      archivesScanned?: number;
+      nestedArchivesScanned?: number;
+    };
+  };
+  
+  /** 队列状态 */
+  queueState: {
+    /** 文件稳定性检查队列 */
+    fileStabilityQueue: FileItem[];
+    
+    /** 压缩包稳定性检查队列 */
+    archiveStabilityQueue: FileItem[];
+    
+    /** MD5计算队列 */
+    md5Queue: FileItem[];
+    
+    /** 打包队列 */
+    packagingQueue: FileItem[];
+    
+    /** 传输队列 */
+    transportQueue: FileItem[];
+    
+    /** 重试队列 */
+    retryQueue: Record<string, {
+      filePath: string;
+      targetQueue: string;
+      retryCount: number;
+      nextRetryTime?: string;
+    }>;
+    
+    /** 各队列正在处理中的文件 */
+    processingFiles: {
+      fileStability: string[];
+      archiveStability: string[];
+      md5: string[];
+      packaging: string[];
+      transport: string[];
+    };
+    
+    /** 压缩包追踪器状态 */
+    archiveTracker: {
+      /** 压缩包 -> 包含的文件路径映射 */
+      archiveToFiles: Record<string, string[]>;
+      
+      /** 压缩包 -> 队列状态映射 */
+      isQueued: Record<string, boolean>;
+      
+      /** 压缩包 -> 处理状态映射 */
+      status: Record<string, 'waiting' | 'processing' | 'stable' | 'unstable' | 'failed'>;
+    };
+  };
+  
+  /** 去重状态 */
+  deduplicatorState?: {
+    /** 当前任务已处理文件的MD5集合 */
+    currentTaskMd5Set: string[];
+    
+    /** 因历史重复而跳过的文件 */
+    skippedHistoricalDuplicates: FileItem[];
+    
+    /** 因任务内重复而跳过的文件 */
+    skippedTaskDuplicates: FileItem[];
+  };
+  
+  /** 处理结果状态 */
+  resultState: {
+    /** 已处理完成的文件 */
+    processedFiles: FileItem[];
+    
+    /** 已创建的包文件路径 */
+    packagePaths: string[];
+    
+    /** 传输结果摘要 */
+    transportSummary: TransportResult[];
+    
+    /** 失败项列表 */
+    failedItems: FailureItem[];
+    
+    /** 处理阶段的耗时统计 */
+    stageTimings?: Record<string, number>;
+  };
+}
+
+/**
+ * 状态管理器接口
+ */
+export interface StateManager {
+  /**
+   * 保存当前任务状态
+   * @param state 要保存的状态对象
+   * @returns 保存是否成功
+   */
+  saveState(state: TaskState): Promise<boolean>;
+  
+  /**
+   * 加载指定任务的状态
+   * @param taskId 任务ID
+   * @param scanId 扫描ID
+   * @returns 加载的状态对象，如果不存在则返回null
+   */
+  loadState(taskId: string, scanId?: string): Promise<TaskState | null>;
+  
+  /**
+   * 清除指定任务的状态
+   * @param taskId 任务ID
+   * @param scanId 扫描ID
+   * @returns 清除是否成功
+   */
+  clearState(taskId: string, scanId?: string): Promise<boolean>;
+  
+  /**
+   * 检查状态是否与当前配置兼容
+   * @param state 加载的状态
+   * @param config 当前配置
+   * @returns 是否兼容
+   */
+  isStateCompatible(state: TaskState, config: ScanAndTransportConfig): boolean;
+}
+```
+
+### 3.3 实现方案详细说明
+
+#### 3.3.1 状态管理器实现
+
+```typescript
+// src/core/state-manager.ts (新建文件)
+
+import * as fs from 'fs-extra';
+import * as path from 'path';
+import { TaskState, StateManager } from '../types/state';
+import { ScanAndTransportConfig } from '../types/facade-v2';
+
+/**
+ * 状态管理器实现
+ */
+export class StateManagerImpl implements StateManager {
+  // 状态文件所在目录
+  private stateDir: string;
+  
+  // 状态文件版本号
+  private readonly STATE_VERSION = '1.0.0';
+  
+  /**
+   * 构造函数
+   * @param stateDir 状态文件存储目录
+   */
+  constructor(stateDir: string) {
+    this.stateDir = stateDir;
+    // 确保状态目录存在
+    fs.ensureDirSync(this.stateDir);
+  }
+  
+  /**
+   * 获取状态文件路径
+   * @param taskId 任务ID
+   * @param scanId 扫描ID
+   */
+  private getStateFilePath(taskId: string, scanId: string): string {
+    return path.join(this.stateDir, `scan-state-${taskId}-${scanId}.json`);
+  }
+  
+  /**
+   * 保存任务状态
+   * @param state 任务状态
+   */
+  public async saveState(state: TaskState): Promise<boolean> {
+    try {
+      const stateFilePath = this.getStateFilePath(state.taskId, state.scanId);
+      const tempFilePath = `${stateFilePath}.tmp`;
+      
+      // 更新时间戳
+      state.lastSavedTime = new Date().toISOString();
+      state.version = this.STATE_VERSION;
+      
+      // 先写入临时文件，然后重命名，确保原子性
+      await fs.writeJson(tempFilePath, state, { spaces: 2 });
+      await fs.rename(tempFilePath, stateFilePath);
+      
+      return true;
+    } catch (error) {
+      console.error('保存状态失败:', error);
+      return false;
+    }
+  }
+  
+  /**
+   * 加载任务状态
+   * @param taskId 任务ID
+   * @param scanId 扫描ID，如果不提供则加载最新的状态
+   */
+  public async loadState(taskId: string, scanId?: string): Promise<TaskState | null> {
+    try {
+      if (scanId) {
+        // 如果提供了scanId，尝试加载指定的状态文件
+        const stateFilePath = this.getStateFilePath(taskId, scanId);
+        if (await fs.pathExists(stateFilePath)) {
+          return await fs.readJson(stateFilePath) as TaskState;
+        }
+        return null;
+      }
+      
+      // 如果没有提供scanId，查找所有匹配taskId的状态文件，并加载最新的一个
+      const files = await fs.readdir(this.stateDir);
+      const stateFiles = files.filter(f => 
+        f.startsWith(`scan-state-${taskId}-`) && f.endsWith('.json')
+      );
+      
+      if (stateFiles.length === 0) {
+        return null;
+      }
+      
+      // 按文件修改时间排序，获取最新的状态文件
+      const statPromises = stateFiles.map(async file => {
+        const filePath = path.join(this.stateDir, file);
+        const stats = await fs.stat(filePath);
+        return { file, stats };
+      });
+      
+      const fileStats = await Promise.all(statPromises);
+      fileStats.sort((a, b) => b.stats.mtimeMs - a.stats.mtimeMs);
+      
+      const latestFile = fileStats[0].file;
+      return await fs.readJson(path.join(this.stateDir, latestFile)) as TaskState;
+    } catch (error) {
+      console.error('加载状态失败:', error);
+      return null;
+    }
+  }
+  
+  /**
+   * 清除任务状态
+   * @param taskId 任务ID
+   * @param scanId 扫描ID，如果不提供则清除所有与taskId相关的状态
+   */
+  public async clearState(taskId: string, scanId?: string): Promise<boolean> {
+    try {
+      if (scanId) {
+        // 清除特定的状态文件
+        const stateFilePath = this.getStateFilePath(taskId, scanId);
+        if (await fs.pathExists(stateFilePath)) {
+          await fs.remove(stateFilePath);
+        }
+        return true;
+      }
+      
+      // 清除所有与taskId相关的状态文件
+      const files = await fs.readdir(this.stateDir);
+      const stateFiles = files.filter(f => 
+        f.startsWith(`scan-state-${taskId}-`) && f.endsWith('.json')
+      );
+      
+      for (const file of stateFiles) {
+        await fs.remove(path.join(this.stateDir, file));
+      }
+      
+      return true;
+    } catch (error) {
+      console.error('清除状态失败:', error);
+      return false;
+    }
+  }
+  
+  /**
+   * 检查状态是否与当前配置兼容
+   * @param state 加载的状态
+   * @param config 当前配置
+   */
+  public isStateCompatible(state: TaskState, config: ScanAndTransportConfig): boolean {
+    // 检查基本配置是否匹配
+    const snapshot = state.configSnapshot;
+    
+    // 任务ID必须匹配
+    if (state.taskId !== config.taskId) {
+      return false;
+    }
+    
+    // 检查根目录是否匹配（顺序可能不同，但内容应该相同）
+    const rootDirsMatch = 
+      snapshot.rootDirs.length === config.rootDirs.length &&
+      snapshot.rootDirs.every(dir => config.rootDirs.includes(dir));
+    
+    if (!rootDirsMatch) {
+      return false;
+    }
+    
+    // 检查规则数量是否匹配
+    if (snapshot.rulesCount !== config.rules.length) {
+      return false;
+    }
+    
+    // 检查输出目录和结果目录是否匹配
+    if (
+      snapshot.outputDir !== config.outputDir ||
+      snapshot.resultsDir !== config.resultsDir
+    ) {
+      return false;
+    }
+    
+    // 检查去重和传输配置是否匹配
+    const deduplicationEnabled = !!config.deduplicatorOptions?.enabled;
+    const transportEnabled = !!config.transport.enabled;
+    
+    if (
+      snapshot.deduplicationEnabled !== deduplicationEnabled ||
+      snapshot.transportEnabled !== transportEnabled
+    ) {
+      return false;
+    }
+    
+    return true;
+  }
+}
+```
+
+#### 3.3.2 状态生成与应用
+
+在 `scanAndTransport` 函数中，我们需要在关键位置添加状态保存和恢复逻辑：
+
+1. **任务开始时的状态恢复**:
+   - 在初始化完成后，检查是否存在状态文件
+   - 如果存在并且与当前配置兼容，加载状态，恢复各个队列和进度数据
+
+2. **关键节点的状态保存**:
+   - 在完成扫描、MD5计算、打包和传输等关键阶段后保存状态
+   - 在长时间运行的队列处理中间定期保存状态
+   - 在任务完成或失败时保存最终状态
+
+3. **任务成功完成时的状态清理**:
+   - 如果任务成功完成，清除状态文件
+
+#### 3.3.3 队列状态和处理进度的恢复
+
+以下是 `scanAndTransport` 函数中恢复状态的伪代码：
+
+```typescript
+// 初始化状态管理器
+const stateManager = new StateManagerImpl(config.resultsDir);
+
+// 尝试加载状态
+const savedState = await stateManager.loadState(config.taskId, scanId);
+let isResuming = false;
+
+if (savedState && stateManager.isStateCompatible(savedState, config)) {
+  isResuming = true;
+  
+  // 恢复扫描状态
+  const completedRootDirs = new Set(savedState.scanState.completedRootDirs);
+  
+  // 跳过已处理的根目录
+  const remainingRootDirs = config.rootDirs.filter(dir => !completedRootDirs.has(dir));
+  
+  // 恢复队列状态
+  const queueState = savedState.queueState;
+  
+  // 恢复各个队列中的文件
+  queueState.fileStabilityQueue.forEach(file => queue.addToQueue('fileStability', file));
+  queueState.archiveStabilityQueue.forEach(file => queue.addToQueue('archiveStability', file));
+  queueState.md5Queue.forEach(file => queue.addToQueue('md5', file));
+  queueState.packagingQueue.forEach(file => queue.addToQueue('packaging', file));
+  queueState.transportQueue.forEach(file => queue.addToQueue('transport', file));
+  
+  // 恢复压缩包追踪器状态
+  for (const [archivePath, filesPaths] of Object.entries(queueState.archiveTracker.archiveToFiles)) {
+    const files = savedState.resultState.processedFiles.filter(f => filesPaths.includes(f.path));
+    files.forEach(file => queue.trackArchiveFile(file));
+  }
+  
+  // 恢复去重状态
+  if (savedState.deduplicatorState && deduplicator) {
+    savedState.deduplicatorState.currentTaskMd5Set.forEach(md5 => 
+      deduplicator.addToCurrentTaskSet(md5)
+    );
+    
+    savedState.deduplicatorState.skippedHistoricalDuplicates.forEach(file => 
+      skippedHistoricalDuplicates.push(file)
+    );
+    
+    savedState.deduplicatorState.skippedTaskDuplicates.forEach(file => 
+      skippedTaskDuplicates.push(file)
+    );
+  }
+  
+  // 恢复结果状态
+  savedState.resultState.processedFiles.forEach(file => processedFiles.push(file));
+  savedState.resultState.packagePaths.forEach(p => packagePaths.push(p));
+  savedState.resultState.transportSummary.forEach(s => transportResults.push(s));
+  savedState.resultState.failedItems.forEach(i => failedItems.push(i));
+  
+  // 记录日志
+  await logToFile(logFilePath, `从中断点恢复任务，上次保存时间: ${savedState.lastSavedTime}`);
+  await logToFile(logFilePath, `恢复了 ${processedFiles.length} 个已处理文件, ${packagePaths.length} 个包, ${transportResults.length} 个传输结果`);
+  
+  // 如果所有根目录都已处理完，直接从队列处理开始
+  if (remainingRootDirs.length === 0) {
+    // 跳过扫描阶段
+    await logToFile(logFilePath, `所有根目录已扫描完成，跳过扫描阶段`);
+  } else {
+    // 只扫描剩余的根目录
+    await logToFile(logFilePath, `恢复扫描，处理剩余的 ${remainingRootDirs.length} 个根目录`);
+    config.rootDirs = remainingRootDirs;
+  }
+}
+```
+
+### 3.4 状态保存时机
+
+为了确保断点续传功能有效工作，我们需要在以下关键节点保存状态：
+
+1. **扫描阶段**:
+   - 每当一个根目录扫描完成时保存状态
+   - 在所有根目录扫描完成后保存状态
+
+2. **队列处理阶段**:
+   - 每隔一定时间（如30秒）或处理一定数量的文件（如50个）后保存一次状态
+   - 在各个处理队列（如稳定性检查、MD5计算、打包、传输）完成重要批次处理后保存状态
+
+3. **任务结束时**:
+   - 在任务成功完成时保存最终状态，然后清除状态文件
+   - 在任务遇到致命错误时保存当前状态
+   - 在进程收到终止信号（如Ctrl+C）时尝试保存状态
+
+### 3.5 性能和空间考量
+
+由于状态文件可能包含大量文件信息，需要考虑以下优化措施：
+
+1. **状态文件大小控制**:
+   - 只存储必要的文件元数据，避免冗余信息
+   - 对于大型任务，考虑分割状态文件或使用压缩存储
+
+2. **性能优化**:
+   - 状态保存应在后台进行，不阻塞主处理流程
+   - 考虑增量更新状态文件，而不是每次都完全重写
+
+3. **错误处理**:
+   - 状态保存失败不应中断主任务
+   - 提供日志警告，但允许任务继续执行
+
+### 3.6 测试方案
+
+为了确保断点续传功能的可靠性，需要设计以下测试场景：
+
+1. **正常中断恢复测试**:
+   - 在不同处理阶段手动中断任务
+   - 确认重启后能正确恢复到中断点，不重复已处理的文件
+
+2. **不兼容配置测试**:
+   - 修改配置后重启任务，验证是否能正确拒绝加载不兼容的状态
+
+3. **状态文件损坏测试**:
+   - 故意损坏状态文件，确认程序能正确处理并回退到全新开始
+
+4. **长时间运行测试**:
+   - 模拟大量文件处理，验证长时间运行时状态保存和恢复的有效性
+
+5. **增量恢复测试**:
+   - 验证状态恢复后，只处理剩余的根目录和文件
 
 **结果体现**:
 
-* 用户在程序异常退出（如崩溃、断电、手动 `Ctrl+C`）后，重新运行相同的命令/任务，程序能自动从接近中断的地方继续执行，显著减少重复工作量。
-* 需要良好的日志记录来表明任务是从恢复状态启动还是全新启动，以及恢复的具体进度点。
+* 用户在程序意外中断后，重新运行相同的命令时，无需重复扫描和处理已完成的文件。
+* 程序日志应清晰记录恢复进度，显示哪些部分是从上次中断恢复的。
+* 即使在处理大量文件时，也能显著减少由于中断导致的重复工作。
 
 ## 4. 历史上传记录的维护 (与需求 1 关联)
 
@@ -147,168 +644,4 @@
 
 * `historical-uploads.json` 文件会随着成功上传的文件不断增长（或保持稳定，如果上传的文件都是重复的）。
 * 后续任务能够利用此文件实现增量上传，跳过内容上已经存在于服务器的文件。
-
-
-好的，我们现在开始设计断点续传功能。
-
-断点续传的核心思想是在任务执行过程中，定期或在关键节点将当前的处理状态持久化（保存到文件）。当任务意外中断（如程序崩溃、手动停止）后重新启动时，程序能够读取上次保存的状态，并从中断的地方继续执行，而不是从头开始。
-
-以下是断点续传功能的接口定义、作用说明以及单元测试方案。
-
-## 1. 新增接口定义与作用
-
-为了实现断点续传，我们需要定义一些接口来描述需要保存的任务状态。这些状态信息将帮助程序在恢复时重建各个处理队列和进度。
-
-```typescript
-// src/types/state.d.ts (建议新建此文件)
-
-import { FileItem, FailureItem, TransportResult } from './index';
-import { PackagingResult } from './packaging';
-
-/**
- * 定义需要持久化的任务状态
- */
-export interface TaskState {
-  /** 任务的唯一标识符 */
-  taskId: string;
-  /** 扫描的唯一标识符 */
-  scanId: string;
-  /** 任务启动时的时间戳 (ISO 8601 格式) */
-  startTime: string;
-  /** 任务配置 (部分关键配置，用于校验或恢复) */
-  configSnapshot: {
-    rootDir: string;
-    rulesCount: number; // 规则数量用于基本校验
-    deduplicationEnabled: boolean;
-    transportEnabled: boolean;
-  };
-
-  /** 扫描阶段状态 */
-  scanState: {
-    /** 已完成扫描的目录列表 (可选，如果恢复粒度需要到目录级别) */
-    completedDirs?: string[];
-    /** 已匹配但尚未进入任何处理队列的文件列表 */
-    pendingMatchedFiles: FileItem[];
-  };
-
-  /** 队列状态 */
-  queueState: {
-    /** 文件稳定性检查等待队列 */
-    fileStabilityQueue: FileItem[];
-    /** 压缩文件稳定性检查等待队列 */
-    archiveStabilityQueue: FileItem[];
-    /** MD5 计算等待队列 */
-    md5Queue: FileItem[];
-    /** 打包等待队列 */
-    packagingQueue: FileItem[];
-    /** 传输等待队列 */
-    transportQueue: FileItem[];
-    /** 重试队列内容 (key: 文件路径, value: 需要返回的队列名) */
-    retryQueue: Record<string, string>;
-    /** 正在处理中的文件 (key: 队列名, value: 文件路径 Set) */
-    processingFiles: Record<string, string[]>;
-    /** 归档文件追踪器状态 */
-    archiveTrackerState: {
-      /** 归档文件 -> 内部文件列表映射 */
-      archiveToFiles: Record<string, string[]>;
-      /** 归档文件 -> 状态映射 */
-      archiveStatus: Record<string, 'waiting' | 'stable' | 'unstable' | 'processing'>;
-    }
-  };
-
-  /** 去重状态 (仅当启用去重时需要) */
-  deduplicationState?: {
-    /** 当前任务中已遇到的非重复文件 MD5 集合 */
-    currentTaskMd5Set: string[];
-    /** 当前任务中因历史重复而被跳过的文件列表 */
-    skippedHistoricalDuplicates: FileItem[];
-    /** 当前任务中因任务内重复而被跳过的文件列表 */
-    skippedTaskDuplicates: FileItem[];
-  };
-
-  /** 处理结果状态 */
-  progressState: {
-    /** 已成功处理并完成的文件列表 (包含MD5等信息) */
-    processedFiles: FileItem[];
-    /** 已完成打包的包文件路径列表 */
-    packagePaths: string[];
-    /** 已完成的传输结果摘要列表 */
-    transportSummary: TransportResult[];
-    /** 记录的失败项列表 */
-    failedItems: FailureItem[];
-  };
-
-  /** 最后保存时间戳 (ISO 8601 格式) */
-  lastSavedTime: string;
-  /** 状态文件的版本号 (用于未来可能的格式升级) */
-  version: string;
-}
-
-```
-
-**接口作用说明**:
-
-*   **`TaskState`**: 顶层接口，聚合了所有需要保存的状态信息。
-    *   `taskId`, `scanId`, `startTime`, `configSnapshot`: 用于标识任务和验证恢复的配置是否匹配。
-    *   `scanState`: 保存扫描阶段的进度，特别是那些已匹配但还未进入后续处理队列的文件。
-    *   `queueState`: 保存各个处理队列（稳定性、MD5、打包、传输、重试）中等待处理的文件，以及正在处理中的文件和压缩包的跟踪状态。这是恢复的核心，允许从队列中断的地方继续。
-    *   `deduplicationState`: 保存当前任务的去重状态，包括已遇到的MD5集合和已跳过的文件列表，确保恢复后去重逻辑的连续性。
-    *   `progressState`: 保存已经成功完成的各阶段结果（已处理文件、已打包路径、已传输结果、失败项），避免重新处理已完成的部分。
-    *   `lastSavedTime`, `version`: 用于跟踪状态文件的新旧和格式兼容性。
-
-## 2. 状态持久化与恢复机制 (概要)
-
-1.  **状态文件**:
-    *   为每个任务（由 `taskId` 标识）创建一个状态文件，例如 `task-state-${taskId}-${scanId}.json`。
-    *   状态文件存储在 `resultsDir` 或一个专门的 `state` 目录下。
-2.  **保存时机**:
-    *   **关键节点**: 在 `scanAndTransport` 函数的主要步骤之间（例如，扫描后、MD5计算后、打包后、传输后）。
-    *   **定期保存**: 在长时间运行的队列处理循环中（例如，每处理N个文件或每隔M分钟）。
-    *   **任务结束/中断时**: 在 `finally` 块中尝试进行最后一次保存。
-3.  **原子性写入**: 采用"写入临时文件 -> 重命名"的方式确保状态文件写入的原子性，防止文件损坏。
-4.  **恢复逻辑**:
-    *   `scanAndTransport` 函数启动时，检查是否存在与 `taskId` 对应的有效状态文件。
-    *   如果存在且有效（例如，`taskId` 匹配，`configSnapshot` 基本一致），则加载状态。
-    *   根据加载的状态信息：
-        *   恢复 `FileProcessingQueue` 的内部队列和追踪器状态。
-        *   恢复 `Deduplicator` 的 `currentTaskMd5Set` 和跳过列表。
-        *   恢复 `processedFiles`, `packagePaths`, `transportSummary`, `failedItems` 列表。
-        *   调整后续逻辑，跳过已完成的步骤，从中断的队列开始处理。
-    *   如果状态文件不存在或无效，则作为新任务启动。
-5.  **状态清理**: 当任务**正常成功完成**后，删除对应的状态文件。
-
-## 3. 单元测试方案
-
-为了确保断点续传功能的健壮性，需要设计以下单元测试场景：
-
-1.  **状态保存测试 (`State Persistence Tests`)**:
-    *   测试在不同阶段（扫描后、MD5处理中、打包后、传输完成、任务结束时）能否正确生成包含预期信息的 `TaskState` 对象。
-    *   测试 `saveStateToFile` 函数能否成功将 `TaskState` 对象写入临时文件并重命名。
-    *   测试状态文件写入失败时的错误处理。
-2.  **状态加载测试 (`State Loading Tests`)**:
-    *   测试 `loadStateFromFile` 函数能否成功读取有效的状态文件并解析为 `TaskState` 对象。
-    *   测试状态文件不存在时的处理（应返回 null 或类似指示）。
-    *   测试状态文件损坏或格式无效时的处理（应视为无效状态）。
-    *   测试加载的状态与当前任务配置不匹配时的处理（例如 `rootDir` 不同，应视为无效状态）。
-3.  **恢复逻辑测试 (`Resumption Logic Tests`)**:
-    *   **场景1：扫描中断恢复**:
-        *   模拟：运行扫描，保存扫描到一半的状态（`scanState.pendingMatchedFiles` 有内容）。
-        *   验证：重新启动任务加载状态后，`FileProcessingQueue` 的 `matchedQueue` 被正确填充，并且后续处理从这些文件开始，而不是重新扫描。
-    *   **场景2：MD5计算中断恢复**:
-        *   模拟：运行到MD5计算阶段，处理一部分文件后保存状态（`queueState.md5Queue` 有剩余，`queueState.packagingQueue` 有部分文件，`deduplicationState` 有内容）。
-        *   验证：重新启动任务加载状态后，MD5队列和打包队列被正确恢复，`Deduplicator` 状态被恢复，处理从剩余的MD5计算开始，已完成MD5的文件进入打包，去重逻辑正确衔接。
-    *   **场景3：打包中断恢复**:
-        *   模拟：运行到打包阶段，成功打了一个包后保存状态（`queueState.packagingQueue` 有剩余，`progressState.packagePaths` 有内容，`queueState.transportQueue` 有一个包）。
-        *   验证：重新启动任务加载状态后，打包队列和传输队列被正确恢复，`packagePaths` 列表被恢复，处理从剩余的打包任务开始。
-    *   **场景4：传输中断恢复**:
-        *   模拟：运行到传输阶段，成功传输部分包后保存状态（`queueState.transportQueue` 有剩余，`progressState.transportSummary` 有部分结果，`deduplicationState.historicalMd5Set` 可能已更新）。
-        *   验证：重新启动任务加载状态后，传输队列和 `transportSummary` 被恢复，处理从剩余的传输任务开始，历史去重记录也应正确恢复。
-    *   **场景5：重试队列恢复**:
-        *   模拟：有文件进入重试队列后保存状态。
-        *   验证：重新启动后，重试队列被恢复，并在合适的时机重新尝试处理。
-4.  **状态清理测试 (`State Cleanup Tests`)**:
-    *   测试任务成功完成后，对应的状态文件是否被正确删除。
-    *   测试任务失败结束时，状态文件是否被保留（以便下次恢复）。
-
-这些测试需要结合 Mocking 技术（例如 Mock 文件系统操作 `fs-extra`，Mock 队列处理逻辑）来隔离测试单元并模拟中断场景。
 

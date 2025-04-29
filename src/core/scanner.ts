@@ -297,7 +297,7 @@ export async function scanFiles(options: ScanOptions): Promise<ScanResult> {
                 archiveCreateTime,
                 archiveModifyTime
               );
-              next();
+              setImmediate(next);
               return;
             }
             
@@ -359,7 +359,7 @@ export async function scanFiles(options: ScanOptions): Promise<ScanResult> {
           }
           
           entryStream.resume();
-          next();
+          setImmediate(next);
         } catch (error: any) {
           const failureItem: FailureItem = {
             type: 'archiveEntry',
@@ -377,7 +377,7 @@ export async function scanFiles(options: ScanOptions): Promise<ScanResult> {
           }
           
           entryStream.resume();
-          next();
+          setImmediate(next);
         }
       });
     });
@@ -494,7 +494,7 @@ export async function scanFiles(options: ScanOptions): Promise<ScanResult> {
                   archiveCreateTime,
                   archiveModifyTime
                 );
-                next();
+                setImmediate(next);
                 return;
               }
               
@@ -557,8 +557,8 @@ export async function scanFiles(options: ScanOptions): Promise<ScanResult> {
                 }
               }
             }
-            entryStream.resume(); 
-            next();
+            entryStream.resume();
+            setImmediate(next);
           } catch (entryError: any) {
             const failureItem: FailureItem = {
               type: 'archiveEntry',
@@ -575,8 +575,8 @@ export async function scanFiles(options: ScanOptions): Promise<ScanResult> {
               onFailure(failureItem, { ...progress });
             }
             
-            entryStream.resume(); 
-            next();
+            entryStream.resume();
+            setImmediate(next);
           }
         });
       });

@@ -8,8 +8,8 @@ import { ScanOptions as NewScanOptions, ScanResult as NewScanResult } from './sc
 import { QueueConfig, StabilityConfig } from './queue';
 
 // 导出重构后的接口
-export { 
-  NewScanOptions, 
+export {
+  NewScanOptions,
   NewScanResult,
   QueueConfig,
   StabilityConfig
@@ -194,10 +194,24 @@ export interface ScanProgress {
  */
 export interface FailureItem {
   /** 失败类型 */
-  type: 'directoryAccess' | 'fileStat' | 'archiveOpen' | 'archiveEntry' | 
-        'rarOpen' | 'nestedArchive' | 'stability' | 'md5' | 'packaging' | 
-        'transport' | 'scanError' | 'archiveStability' | 'extractArchive' |
-        'ignoredLargeFile';
+
+
+  type:
+  | 'directoryAccess'   // 无法访问目录
+  | 'fileStat'          // 无法获取文件状态
+  | 'archiveOpen'       // 无法打开压缩包 (compressing库)
+  | 'archiveEntry'      // 处理压缩包内条目时出错
+  | 'rarOpen'           // 无法打开RAR压缩包 (node-unrar-js)
+  | 'stability'         // 文件稳定性检查失败
+  | 'md5'               // MD5计算失败
+  | 'packaging'         // 打包失败
+  | 'transport'         // 传输失败
+  | 'scanError'         // 扫描过程中的一般错误
+  | 'archiveStability'  // 压缩包稳定性检查失败
+  | 'extractArchive'    // 解压归档文件失败
+  | 'nestedArchive'     // 处理嵌套压缩文件时出错
+  | 'ignoredLargeFile'  // 文件因过大而被忽略
+  | 'stackOverflow';    // 检测到堆栈溢出（通常在处理深度嵌套或循环引用时）
   /** 发生失败的文件、目录或压缩包的路径 */
   path: string;
   /** 如果是压缩包内条目处理失败，这里是内部路径 */
