@@ -64,8 +64,8 @@ const DEFAULT_STABILITY_CONFIG: StabilityConfig = {
 };
 const DEFAULT_QUEUE_CONFIG: QueueConfig = {
   enabled: true,
-  maxConcurrentFileChecks: 5,
-  maxConcurrentArchiveChecks: 3,
+  maxConcurrentFileChecks: 100,
+  maxConcurrentArchiveChecks: 50,
   maxConcurrentMd5: 5,
   maxConcurrentTransfers: 2,
   stabilityRetryDelay: 2000
