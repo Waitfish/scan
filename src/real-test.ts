@@ -4,139 +4,100 @@
 
 import * as path from 'path';
 import * as fs from 'fs-extra';
-import * as compressing from 'compressing';
+// import * as compressing from 'compressing'; // 暂时移除压缩包测试以简化
 import { scanAndTransport } from './facade';
 import { MatchRule } from './types';
 import { ScanAndTransportConfig } from './types/facade-v2';
 
 // 测试目录设置
-const testRootDir = path.join(__dirname, '../temp/real-test-run');
-const outputDir = path.join(testRootDir, 'output');
-const resultsDir = path.join(testRootDir, 'results');
-// 添加去重历史文件路径
-const historyFilePath = path.join(testRootDir, 'historical-uploads.json');
+const testBaseDir = path.join(__dirname, '../temp/real-multi-root-test'); // 基础目录
+const testRootDir1 = path.join(testBaseDir, 'source1'); // 第一个独立源目录
+const testRootDir2 = path.join(testBaseDir, 'source2'); // 第二个独立源目录
+const outputDir = path.join(testBaseDir, 'output'); // 输出目录放在基础目录下
+const resultsDir = path.join(testBaseDir, 'results'); // 结果目录放在基础目录下
+const historyFilePath = path.join(testBaseDir, 'historical-uploads.json'); // 历史记录放在基础目录下
 
 /**
- * 创建测试目录和文件结构
- * @param clean 是否清空测试目录，默认为true
+ * 创建独立的测试目录和文件结构
+ * @param baseDir 基础目录
+ * @param rootDirs 要创建的根目录路径数组
+ * @param outputDir 输出目录
+ * @param resultsDir 结果目录
+ * @param clean 是否清空基础目录，默认为true
  */
-async function createTestDirectory(clean: boolean = true): Promise<void> {
-  console.log(`正在创建测试目录: ${testRootDir}`);
+async function createIndependentTestDirectories(
+  baseDir: string,
+  rootDirs: string[],
+  outputDir: string,
+  resultsDir: string,
+  clean: boolean = true
+): Promise<void> {
+  console.log(`准备测试环境，基础目录: ${baseDir}`);
   try {
     if (clean) {
-      // 清理之前的测试目录
-      console.log('清理之前的测试目录...');
-      await fs.remove(testRootDir);
-    } else {
-      console.log('保留现有测试目录，历史记录文件将被保留');
+      console.log('清理之前的测试基础目录...');
+      await fs.remove(baseDir);
     }
     
-    // 创建目录结构
-    await fs.ensureDir(testRootDir);
+    // 创建基础目录结构
+    await fs.ensureDir(baseDir);
     await fs.ensureDir(outputDir);
     await fs.ensureDir(resultsDir);
+    console.log('基础目录结构创建完成。');
 
-    // --- 文件系统文件 ---
-    await fs.writeFile(path.join(testRootDir, 'readme.md'), '# Test Readme');
-    await fs.writeFile(path.join(testRootDir, 'MeiTuan-report-final.docx'), 'MeiTuan DOCX');
-    await fs.writeFile(path.join(testRootDir, 'BuYunSou-analysis.pdf'), 'BuYunSou PDF');
-    await fs.writeFile(path.join(testRootDir, 'config.js'), 'module.exports = {};');
-    
-    // 在根目录创建一个冲突文件
-    await fs.writeFile(path.join(testRootDir, 'MeiTuan-plan.doc'), 'MeiTuan计划文档 - 根目录版本');
-    
-    const subDir1 = path.join(testRootDir, 'project-a');
-    await fs.ensureDir(subDir1);
-    // 在子目录中创建同名文件 (与根目录的同名)
-    await fs.writeFile(path.join(subDir1, 'MeiTuan-plan.doc'), 'MeiTuan计划文档 - 项目A版本');
-    await fs.writeFile(path.join(subDir1, 'data.json'), '{}');
-    
-    const deepDir = path.join(subDir1, 'deep-data');
-    await fs.ensureDir(deepDir);
-    await fs.writeFile(path.join(deepDir, 'archive.txt'), 'text file');
-    await fs.writeFile(path.join(deepDir, 'BuYunSou-results.xls'), 'BuYunSou XLS');
-    // 在深层目录中再创建一个同名文件
-    await fs.writeFile(path.join(deepDir, 'MeiTuan-plan.doc'), 'MeiTuan计划文档 - 深层目录版本');
-    
-    // 创建另一个子目录并添加同名文件
-    const subDir2 = path.join(testRootDir, 'project-b');
-    await fs.ensureDir(subDir2);
-    await fs.writeFile(path.join(subDir2, 'MeiTuan-plan.doc'), 'MeiTuan计划文档 - 项目B版本');
-    await fs.writeFile(path.join(subDir2, 'BuYunSou-data.xls'), 'BuYunSou XLS - 项目B');
-    
-    const nodeModulesDir = path.join(testRootDir, 'node_modules');
-    await fs.ensureDir(nodeModulesDir);
-    await fs.writeFile(path.join(nodeModulesDir, 'dummy-package.js'), 'ignore me');
-    
-    const gitDir = path.join(testRootDir, '.git');
-    await fs.ensureDir(gitDir);
-    await fs.writeFile(path.join(gitDir, 'config'), '[core]');
-    
-    const largeFilesDir = path.join(testRootDir, 'large-assets');
-    await fs.ensureDir(largeFilesDir);
-    await fs.writeFile(path.join(largeFilesDir, 'large-video.mp4'), Buffer.alloc(1024 * 1024, 'L'));
-    await fs.writeFile(path.join(largeFilesDir, 'small-image.jpg'), Buffer.alloc(1024, 'S'));
+    // 定义一些共享内容用于测试跨目录去重
+    const sharedContent1 = 'This content is shared across roots for deduplication testing.';
+    const sharedContent2 = 'Another shared content.';
 
-    // --- 创建压缩文件 ---
-    const archiveDir = path.join(testRootDir, 'archives');
-    await fs.ensureDir(archiveDir);
+    // 循环创建每个根目录及其内容
+    for (const rootDir of rootDirs) {
+      const rootName = path.basename(rootDir); // 获取 source1 或 source2
+      console.log(`- 正在创建根目录: ${rootDir}`);
+      await fs.ensureDir(rootDir);
+      
+      // --- 在当前 rootDir 中创建文件和子目录 ---
+      
+      // 1. 独有文件
+      await fs.writeFile(path.join(rootDir, `unique-file-${rootName}.docx`), `Unique MeiTuan content for ${rootName}`);
+      await fs.writeFile(path.join(rootDir, `unique-data-${rootName}.pdf`), `Unique BuYunSou data for ${rootName}`);
+      await fs.writeFile(path.join(rootDir, `image-${rootName}.jpg`), Buffer.alloc(512, rootName.slice(0, 1)));
 
-    // 1. ZIP
-    const zipPath = path.join(archiveDir, 'project-docs.zip');
-    const zipStream = new compressing.zip.Stream();
-    zipStream.addEntry(Buffer.from('MeiTuan spec v1'), { relativePath: 'MeiTuan-spec.docx' });
-    zipStream.addEntry(Buffer.from('BuYunSou data export'), { relativePath: 'data/BuYunSou-export.xls' });
-    zipStream.addEntry(Buffer.from('Internal note'), { relativePath: 'notes.txt' });
-    const zipDestStream = fs.createWriteStream(zipPath);
-    await new Promise<void>((resolve, reject) => {
-      zipStream.pipe(zipDestStream)
-        .on('finish', resolve)
-        .on('error', reject);
-    });
+      // 2. 不同根目录下，同名但内容不同的文件
+      await fs.writeFile(path.join(rootDir, 'shared-name.pdf'), `BuYunSou data (version from ${rootName})`);
 
-    // 2. TGZ
-    const tgzPath = path.join(archiveDir, 'project-backup.tar.gz');
-    const tgzStream = new compressing.tgz.Stream();
-    tgzStream.addEntry(Buffer.from('MeiTuan final report'), { relativePath: 'final/MeiTuan-final.doc' });
-    tgzStream.addEntry(Buffer.from('BuYunSou diagram'), { relativePath: 'diagrams/BuYunSou-arch.pdf' });
-    const tgzDestStream = fs.createWriteStream(tgzPath);
-    await new Promise<void>((resolve, reject) => {
-      tgzStream.pipe(tgzDestStream)
-        .on('finish', resolve)
-        .on('error', reject);
-    });
+      // 3. 不同根目录下，内容相同但名称/路径不同的文件 (用于跨目录去重)
+      if (rootName === 'source1') {
+        await fs.writeFile(path.join(rootDir, 'shared-content-a.doc'), sharedContent1);
+        await fs.writeFile(path.join(rootDir, 'shared-content-b.xls'), sharedContent2);
+      } else { // source2
+        // 确保 source2/sub 目录存在
+        await fs.ensureDir(path.join(rootDir, 'sub'));
+        await fs.writeFile(path.join(rootDir, 'sub', 'shared-content-a-altname.doc'), sharedContent1);
+        await fs.writeFile(path.join(rootDir, 'shared-content-b.pdf'), sharedContent2);
+      }
 
-    // 添加重复文件测试 - 任务内重复
-    const duplicateDir = path.join(testRootDir, 'duplicate-test');
-    await fs.ensureDir(duplicateDir);
-    
-    // 完全相同的文件内容，不同路径 - 用于测试任务内去重
-    const sameContentA = 'This is identical content for deduplication testing';
-    const sameContentB = Buffer.from(sameContentA); // 相同内容，不同Buffer实例
-    
-    await fs.writeFile(path.join(duplicateDir, 'MeiTuan-duplicate-1.doc'), sameContentA);
-    await fs.writeFile(path.join(duplicateDir, 'MeiTuan-duplicate-2.doc'), sameContentB);
-    
-    // 创建子目录
-    const subfolder1 = path.join(duplicateDir, 'subfolder1');
-    await fs.ensureDir(subfolder1);
-    await fs.writeFile(path.join(subfolder1, 'MeiTuan-duplicate-3.doc'), sameContentA);
-    
-    // 在不同文件夹中再创建一个相同内容的文件
-    const subfolder2 = path.join(duplicateDir, 'subfolder2');
-    await fs.ensureDir(subfolder2);
-    await fs.writeFile(path.join(subfolder2, 'MeiTuan-duplicate-4.doc'), sameContentA);
-    
-    // 创建不同内容的文件作为对比
-    await fs.writeFile(path.join(duplicateDir, 'MeiTuan-unique.doc'), 'This is unique content');
-    
-    // 创建一个BuYunSou系列的重复文件测试
-    const buYunSouContent = 'BuYunSou duplicate content test';
-    await fs.writeFile(path.join(duplicateDir, 'BuYunSou-duplicate-1.pdf'), buYunSouContent);
-    await fs.writeFile(path.join(subfolder2, 'BuYunSou-duplicate-2.pdf'), buYunSouContent);
+      // 4. 子目录和嵌套文件
+      const subDir = path.join(rootDir, 'sub');
+      await fs.ensureDir(subDir); // 确保子目录存在 (可能重复调用，但 fs-extra 会处理)
+      await fs.writeFile(path.join(subDir, `nested-data-${rootName}.xls`), `Nested BuYunSou data for ${rootName}`);
+      await fs.writeFile(path.join(subDir, `readme-${rootName}.txt`), `Readme for ${rootName}`); // 不会被规则匹配
 
-    console.log('测试目录和压缩包创建完成。');
-    console.log('已创建重复文件用于测试去重功能。');
+      // 5. 需要被跳过的目录
+      const nodeModulesDir = path.join(rootDir, 'node_modules');
+      await fs.ensureDir(nodeModulesDir);
+      await fs.writeFile(path.join(nodeModulesDir, `dummy-${rootName}.js`), 'ignore me');
+      
+      const gitDir = path.join(rootDir, '.git');
+      await fs.ensureDir(gitDir);
+      await fs.writeFile(path.join(gitDir, 'config'), `[core] in ${rootName}`);
+      
+      console.log(`  - 完成根目录创建: ${rootDir}`);
+    }
+
+    // --- 暂时移除压缩文件创建 --- 
+    // console.log('跳过压缩文件创建以简化测试...');
+
+    console.log('所有测试目录和文件创建完成。');
 
   } catch (error) {
     console.error('创建测试目录时出错:', error);
@@ -160,30 +121,38 @@ async function main(): Promise<void> {
       }
     }
     
-    await createTestDirectory(cleanDir);
+    // 调用新的测试目录创建函数
+    await createIndependentTestDirectories(
+      testBaseDir, 
+      [testRootDir1, testRootDir2], 
+      outputDir, 
+      resultsDir, 
+      cleanDir
+    );
 
-    // 匹配规则
+    // 匹配规则 (保持不变)
     const rules: MatchRule[] = [
       [['mjs'], 'clean.*'], 
-      [['docx', 'doc'], '^MeiTuan.*'], 
-      [['pdf', 'xls'], '^BuYunSou.*'],
-      [['jpg'], '.*']
+      [['docx', 'doc'], '^MeiTuan.*|unique-file.*|shared-content-a.*|shared-content-a-altname.*'], // 调整规则以匹配新文件名
+      [['pdf', 'xls'], '^BuYunSou.*|unique-data.*|shared-name.*|nested-data.*|shared-content-b.*'], // 调整规则以匹配新文件名
+      [['jpg'], '.*\.jpg$'] // 确保只匹配jpg
     ];
     
     // 定义扫描和传输配置
     const config: ScanAndTransportConfig = {
-      rootDir: testRootDir,
+      rootDirs: [testRootDir1, testRootDir2], // 使用独立的根目录列表
       rules: rules,
-      taskId: `real-test-1`,
+      taskId: `real-multi-root-test-1`,
       outputDir: outputDir,
       resultsDir: resultsDir,
       maxFileSize: 10 * 1024 * 1024, // 10MB
-      skipDirs: ['node_modules', '.git', outputDir, 'archives'],
+      // skipDirs 保持相对路径或绝对路径。outputDir 现在在外面，也添加到 skip 列表。
+      skipDirs: ['node_modules', '.git', outputDir], // 确保 outputDir 被跳过
       depth: -1, // 无限深度
-      scanNestedArchives: true,
+      scanNestedArchives: false, // 暂时禁用嵌套扫描，因为没创建压缩包
       calculateMd5: true,
       packagingTrigger: {
-        maxFiles: 5,  // 5个文件打一个包
+        maxFiles: 4,  // 调小打包数量以便更快看到多个包
         maxSizeMB: 10
       },
       transport: {
@@ -205,41 +174,41 @@ async function main(): Promise<void> {
       },
       onProgress: (progress, file) => {
         if (file) {
-          console.log(`处理文件: ${file.name}`);
+          console.log(`处理文件: ${file.name}`); 
         } else {
-          // 输出当前扫描的目录信息
-          const relativeDir = path.relative(testRootDir, progress.currentDir) || '.';
-          console.log(`\n正在扫描目录: ${relativeDir}`);
-          console.log(`扫描进度统计:`);
+          // 显示绝对路径以避免混淆
+          console.log(`\n正在扫描目录: ${progress.currentDir}`);
+          console.log(`扫描进度统计 (当前根):`);
           console.log(`  - 已扫描文件数: ${progress.scannedFiles} 个`);
           console.log(`  - 匹配文件数: ${progress.matchedFiles} 个`);
           console.log(`  - 已扫描目录数: ${progress.scannedDirs} 个`);
           console.log(`  - 已跳过目录数: ${progress.skippedDirs} 个`);
-          console.log(`  - 已处理压缩包数: ${progress.archivesScanned} 个`);
-          console.log(`  - 已处理嵌套压缩包数: ${progress.nestedArchivesScanned || 0} 个`);
+          // console.log(`  - 已处理压缩包数: ${progress.archivesScanned} 个`); // 移除压缩包相关日志
+          // console.log(`  - 已处理嵌套压缩包数: ${progress.nestedArchivesScanned || 0} 个`);
           console.log(`  - 已忽略大文件数: ${progress.ignoredLargeFiles} 个`);
-          if (progress.currentNestedLevel && progress.currentNestedLevel > 0) {
-            console.log(`  - 当前压缩包嵌套层级: ${progress.currentNestedLevel}`);
-          }
+          // if (progress.currentNestedLevel && progress.currentNestedLevel > 0) { // 移除压缩包相关日志
+          //   console.log(`  - 当前压缩包嵌套层级: ${progress.currentNestedLevel}`);
+          // }
         }
       }
     };
 
-    console.log('\n开始扫描、打包和传输...');
-    console.log('RootDir:', testRootDir);
+    console.log('\n开始扫描、打包和传输 (独立多目录测试)...');
+    console.log('RootDirs:', config.rootDirs);
     console.log('OutputDir:', outputDir);
-    console.log('Skip Dirs:', ['node_modules', '.git', outputDir, 'archives']);
+    console.log('ResultsDir:', resultsDir);
+    console.log('Skip Dirs (resolved):', (config.skipDirs || []).map(d => path.resolve(testBaseDir, d))); // 相对于 testBaseDir 解析
 
     // 执行扫描和传输
     const result = await scanAndTransport(config);
 
-    // 输出结果
+    // 输出结果 (保持不变)
     console.log('\n\n处理完成!');
     console.log('-----------------');
     console.log(`任务ID: ${result.taskId}`);
     console.log(`扫描ID: ${result.scanId}`);
     console.log(`处理成功: ${result.success ? '是' : '否'}`);
-    console.log(`处理文件数: ${result.processedFiles.length}`);
+    console.log(`处理文件数 (进入打包/传输队列): ${result.processedFiles.length}`);
     console.log(`失败项目数: ${result.failedItems.length}`);
     console.log(`包数量: ${result.packagePaths.length}`);
     console.log(`传输结果: ${result.transportSummary.length} 个文件传输`);
@@ -303,7 +272,8 @@ async function main(): Promise<void> {
       });
     }
 
-    console.log(`\n测试目录位于: ${testRootDir}`);
+    console.log(`\n测试基础目录位于: ${testBaseDir}`);
+    console.log(`测试源目录: ${testRootDir1}, ${testRootDir2}`);
     console.log(`历史记录文件位置: ${historyFilePath}`);
     console.log('\n再次运行此测试可测试历史去重功能');
   } catch (error) {

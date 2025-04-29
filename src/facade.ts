@@ -127,10 +127,17 @@ export async function scanAndTransport(config: ScanAndTransportConfig): Promise<
   const taskId = config.taskId || crypto.randomUUID(); // 使用提供的任务ID或生成新的
   const scanId = `scan_${startTime.getTime()}`; // 基于时间戳创建扫描ID
   
+  // 将 rootDirs 转换为绝对路径数组 (使用正确的 config.rootDirs)
+  const rootDirs = config.rootDirs.map((dir: string) => path.resolve(dir)); // 添加 dir 类型注解
+  if (rootDirs.length === 0) {
+    throw new Error('rootDirs cannot be empty.');
+  }
+  
   const outputDir = path.resolve(config.outputDir ?? DEFAULT_OUTPUT_DIR);
   const resultsDir = path.resolve(config.resultsDir ?? DEFAULT_RESULTS_DIR);
   const maxFileSize = config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE;
-  const skipDirs = config.skipDirs ?? DEFAULT_SKIP_DIRS;
+  // skipDirs 处理: 解析为绝对路径
+  const skipDirsList = (config.skipDirs ?? DEFAULT_SKIP_DIRS).map(dir => path.resolve(dir));
   const depth = config.depth ?? DEFAULT_DEPTH;
   const scanNestedArchives = config.scanNestedArchives ?? DEFAULT_SCAN_NESTED_ARCHIVES;
   const maxNestedLevel = config.maxNestedLevel ?? DEFAULT_MAX_NESTED_LEVEL;
@@ -161,27 +168,26 @@ export async function scanAndTransport(config: ScanAndTransportConfig): Promise<
   await logToFile(logFilePath, `任务ID: ${taskId}, 扫描ID: ${scanId}`);
   await logToFile(logFilePath, `开始时间: ${startTime.toISOString()}`);
   await logToFile(logFilePath, `配置: ${JSON.stringify({
-    rootDir: config.rootDir,
+    rootDirs: rootDirs, // 使用处理后的 rootDirs
     rulesCount: config.rules.length,
     outputDir,
     resultsDir,
-    skipDirs,
+    skipDirs: skipDirsList, // 使用处理后的 skipDirs
     depth,
     maxFileSize,
     scanNestedArchives,
     calculateMd5
   })}`);
 
-  // 5. 初始化文件处理队列
+  // 5. 初始化共享的文件处理队列和去重器 (在循环外)
   const queue = new FileProcessingQueue(queueConfig, stabilityConfig);
   await logToFile(logFilePath, `队列系统初始化完成`);
   
-  // 初始化去重器
   const deduplicator = createDeduplicator(deduplicatorOptions);
   await deduplicator.initialize();
   await logToFile(logFilePath, `去重系统初始化完成，历史记录数量: ${deduplicator.getHistoricalMd5Set().size}`);
   
-  // 6. 收集结果和失败项
+  // 6. 初始化共享的结果和失败项收集器 (在循环外)
   const matchedFiles: FileItem[] = [];
   const processedFiles: FileItem[] = [];
   const failedItems: FailureItem[] = [];
@@ -192,19 +198,16 @@ export async function scanAndTransport(config: ScanAndTransportConfig): Promise<
     remotePath: string;
     error?: string;
   }[] = [];
-  
-  // 用于收集去重结果
   const skippedHistoricalDuplicates: FileItem[] = [];
   const skippedTaskDuplicates: FileItem[] = [];
   
-  // 用于存储最终结果的对象
+  // 用于存储最终结果的对象 (在循环外)
   const result: ScanAndTransportResult = {
     success: false,
     processedFiles: [],
     failedItems: [],
     packagePaths: [],
     transportSummary: [],
-    // 添加去重结果到返回对象
     skippedHistoricalDuplicates: [],
     skippedTaskDuplicates: [],
     logFilePath,
@@ -212,60 +215,69 @@ export async function scanAndTransport(config: ScanAndTransportConfig): Promise<
     scanId,
     resultFilePath: getResultFilePath(resultsDir, taskId, scanId),
     startTime,
-    endTime: new Date(), // 临时值，将在处理完成后更新
-    elapsedTimeMs: 0 // 临时值，将在处理完成后更新
+    endTime: new Date(), // 临时值
+    elapsedTimeMs: 0 // 临时值
   };
   
+  let totalMatchedFiles = 0; // 用于跟踪所有根目录的总匹配文件数
+
   try {
-    // 7. 构建扫描选项
-    const scanOptions: ScanOptions = {
-      rootDir: path.resolve(config.rootDir),
-      matchRules: config.rules,
-      depth,
-      maxFileSize,
-      skipDirs: skipDirs.map(dir => path.resolve(config.rootDir, dir)),
-      scanNestedArchives,
-      maxNestedLevel,
-      taskId,
-      onProgress: (progress) => {
-        // 更新进度信息
-        if (config.onProgress) {
-          config.onProgress(progress);
+    // 7. 循环处理每个根目录
+    for (const currentRootDir of rootDirs) {
+      await logToFile(logFilePath, `开始扫描根目录: ${currentRootDir}`);
+      
+      // 7.1 构建当前根目录的扫描选项
+      const scanOptions: ScanOptions = {
+        rootDir: currentRootDir, // 使用当前循环的根目录
+        matchRules: config.rules,
+        depth,
+        maxFileSize,
+        skipDirs: skipDirsList, // 使用处理好的绝对路径列表
+        scanNestedArchives,
+        maxNestedLevel,
+        taskId,
+        onProgress: (progress) => {
+          // 更新进度信息 - 注意这里的进度是相对于当前根目录的
+          // 如果需要总进度，需要在此处进行聚合
+          if (config.onProgress) {
+            // 可以考虑传递一个包含当前 rootDir 的扩展进度对象
+            config.onProgress(progress);
+          }
+        },
+        onFileMatched: (file, progress) => {
+          // 当文件匹配时，添加到 *共享* 的队列管理系统
+          matchedFiles.push(file); // matchedFiles 列表现在聚合所有根目录的结果
+          queue.addToMatchedQueue(file);
+          
+          // 如果有外部进度回调，调用它
+          if (config.onProgress) {
+            config.onProgress(progress, file);
+          }
+        },
+        onFailure: (failure, progress) => {
+          // 记录扫描失败项到 *共享* 的列表
+          failedItems.push(failure);
+          
+          // 记录到日志
+          logToFile(logFilePath, `扫描失败: ${failure.path}, 类型: ${failure.type}, 错误: ${failure.error}`);
+          
+          // 如果有外部进度回调，调用它
+          if (config.onProgress) {
+            config.onProgress(progress);
+          }
         }
-      },
-      onFileMatched: (file, progress) => {
-        // 当文件匹配时，添加到队列管理系统
-        matchedFiles.push(file);
-        queue.addToMatchedQueue(file);
-        
-        // 如果有外部进度回调，调用它
-        if (config.onProgress) {
-          config.onProgress(progress, file);
-        }
-      },
-      onFailure: (failure, progress) => {
-        // 记录扫描失败项
-        failedItems.push(failure);
-        
-        // 记录到日志
-        logToFile(logFilePath, `扫描失败: ${failure.path}, 类型: ${failure.type}, 错误: ${failure.error}`);
-        
-        // 如果有外部进度回调，调用它
-        if (config.onProgress) {
-          config.onProgress(progress);
-        }
-      }
-    };
+      };
+      
+      // 7.2 执行当前根目录的扫描
+      const scanResult = await scanFiles(scanOptions);
+      await logToFile(logFilePath, `根目录扫描完成: ${currentRootDir}，找到 ${scanResult.matchedFiles.length} 个匹配文件`);
+      totalMatchedFiles += scanResult.matchedFiles.length;
+    } // 结束 rootDirs 循环
     
-    await logToFile(logFilePath, `开始扫描文件...`);
-    
-    // 8. 执行扫描
-    const scanResult = await scanFiles(scanOptions);
-    
-    await logToFile(logFilePath, `扫描完成，找到 ${scanResult.matchedFiles.length} 个匹配文件`);
+    await logToFile(logFilePath, `所有根目录扫描完成，共找到 ${totalMatchedFiles} 个匹配文件`);
     await logToFile(logFilePath, `处理扫描队列...`);
     
-    // 9. 处理匹配队列，将文件分配到合适的队列
+    // 9. 处理匹配队列 (现在包含所有根目录的文件)
     queue.processMatchedQueue();
     
     // 10. 处理文件稳定性队列
@@ -301,7 +313,7 @@ export async function scanAndTransport(config: ScanAndTransportConfig): Promise<
     await processRetryQueue();
     await logToFile(logFilePath, `重试队列处理完成`);
     
-    // 16. 收集最终结果
+    // 16. 收集最终结果 (从共享的队列和去重器收集)
     processedFiles.push(...queue.getCompletedFiles());
     failedItems.push(...queue.getFailedFiles().map(file => {
       return {
@@ -363,10 +375,10 @@ export async function scanAndTransport(config: ScanAndTransportConfig): Promise<
     result.success = failedItems.length === 0;
     
   } catch (error: any) {
-    // 处理顶层错误
+    // 处理顶层错误 (使用 rootDirs[0])
     const failureItem: FailureItem = {
       type: 'scanError',
-      path: config.rootDir,
+      path: rootDirs[0] || 'N/A', 
       error: error.message || String(error)
     };
     failedItems.push(failureItem);

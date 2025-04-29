@@ -148,3 +148,172 @@
 * `historical-uploads.json` 文件会随着成功上传的文件不断增长（或保持稳定，如果上传的文件都是重复的）。
 * 后续任务能够利用此文件实现增量上传，跳过内容上已经存在于服务器的文件。
 
+
+好的，我们现在开始设计断点续传功能。
+
+断点续传的核心思想是在任务执行过程中，定期或在关键节点将当前的处理状态持久化（保存到文件）。当任务意外中断（如程序崩溃、手动停止）后重新启动时，程序能够读取上次保存的状态，并从中断的地方继续执行，而不是从头开始。
+
+以下是断点续传功能的接口定义、作用说明以及单元测试方案。
+
+## 1. 新增接口定义与作用
+
+为了实现断点续传，我们需要定义一些接口来描述需要保存的任务状态。这些状态信息将帮助程序在恢复时重建各个处理队列和进度。
+
+```typescript
+// src/types/state.d.ts (建议新建此文件)
+
+import { FileItem, FailureItem, TransportResult } from './index';
+import { PackagingResult } from './packaging';
+
+/**
+ * 定义需要持久化的任务状态
+ */
+export interface TaskState {
+  /** 任务的唯一标识符 */
+  taskId: string;
+  /** 扫描的唯一标识符 */
+  scanId: string;
+  /** 任务启动时的时间戳 (ISO 8601 格式) */
+  startTime: string;
+  /** 任务配置 (部分关键配置，用于校验或恢复) */
+  configSnapshot: {
+    rootDir: string;
+    rulesCount: number; // 规则数量用于基本校验
+    deduplicationEnabled: boolean;
+    transportEnabled: boolean;
+  };
+
+  /** 扫描阶段状态 */
+  scanState: {
+    /** 已完成扫描的目录列表 (可选，如果恢复粒度需要到目录级别) */
+    completedDirs?: string[];
+    /** 下一个待扫描的目录 (可选，更精细的恢复点) */
+    nextDirToScan?: string;
+    /** 已匹配但尚未进入任何处理队列的文件列表 */
+    pendingMatchedFiles: FileItem[];
+  };
+
+  /** 队列状态 */
+  queueState: {
+    /** 文件稳定性检查等待队列 */
+    fileStabilityQueue: FileItem[];
+    /** 压缩文件稳定性检查等待队列 */
+    archiveStabilityQueue: FileItem[];
+    /** MD5 计算等待队列 */
+    md5Queue: FileItem[];
+    /** 打包等待队列 */
+    packagingQueue: FileItem[];
+    /** 传输等待队列 */
+    transportQueue: FileItem[];
+    /** 重试队列内容 (key: 文件路径, value: 需要返回的队列名) */
+    retryQueue: Record<string, string>;
+    /** 正在处理中的文件 (key: 队列名, value: 文件路径 Set) */
+    processingFiles: Record<string, string[]>;
+    /** 归档文件追踪器状态 */
+    archiveTrackerState: {
+      /** 归档文件 -> 内部文件列表映射 */
+      archiveToFiles: Record<string, string[]>;
+      /** 归档文件 -> 状态映射 */
+      archiveStatus: Record<string, 'waiting' | 'stable' | 'unstable' | 'processing'>;
+    }
+  };
+
+  /** 去重状态 (仅当启用去重时需要) */
+  deduplicationState?: {
+    /** 当前任务中已遇到的非重复文件 MD5 集合 */
+    currentTaskMd5Set: string[];
+    /** 当前任务中因历史重复而被跳过的文件列表 */
+    skippedHistoricalDuplicates: FileItem[];
+    /** 当前任务中因任务内重复而被跳过的文件列表 */
+    skippedTaskDuplicates: FileItem[];
+  };
+
+  /** 处理结果状态 */
+  progressState: {
+    /** 已成功处理并完成的文件列表 (包含MD5等信息) */
+    processedFiles: FileItem[];
+    /** 已完成打包的包文件路径列表 */
+    packagePaths: string[];
+    /** 已完成的传输结果摘要列表 */
+    transportSummary: TransportResult[];
+    /** 记录的失败项列表 */
+    failedItems: FailureItem[];
+  };
+
+  /** 最后保存时间戳 (ISO 8601 格式) */
+  lastSavedTime: string;
+  /** 状态文件的版本号 (用于未来可能的格式升级) */
+  version: string;
+}
+
+```
+
+**接口作用说明**:
+
+*   **`TaskState`**: 顶层接口，聚合了所有需要保存的状态信息。
+    *   `taskId`, `scanId`, `startTime`, `configSnapshot`: 用于标识任务和验证恢复的配置是否匹配。
+    *   `scanState`: 保存扫描阶段的进度，特别是那些已匹配但还未进入后续处理队列的文件。
+    *   `queueState`: 保存各个处理队列（稳定性、MD5、打包、传输、重试）中等待处理的文件，以及正在处理中的文件和压缩包的跟踪状态。这是恢复的核心，允许从队列中断的地方继续。
+    *   `deduplicationState`: 保存当前任务的去重状态，包括已遇到的MD5集合和已跳过的文件列表，确保恢复后去重逻辑的连续性。
+    *   `progressState`: 保存已经成功完成的各阶段结果（已处理文件、已打包路径、已传输结果、失败项），避免重新处理已完成的部分。
+    *   `lastSavedTime`, `version`: 用于跟踪状态文件的新旧和格式兼容性。
+
+## 2. 状态持久化与恢复机制 (概要)
+
+1.  **状态文件**:
+    *   为每个任务（由 `taskId` 标识）创建一个状态文件，例如 `task-state-${taskId}.json`。
+    *   状态文件存储在 `resultsDir` 或一个专门的 `state` 目录下。
+2.  **保存时机**:
+    *   **关键节点**: 在 `scanAndTransport` 函数的主要步骤之间（例如，扫描后、MD5计算后、打包后、传输后）。
+    *   **定期保存**: 在长时间运行的队列处理循环中（例如，每处理N个文件或每隔M分钟）。
+    *   **任务结束/中断时**: 在 `finally` 块中尝试进行最后一次保存。
+3.  **原子性写入**: 采用"写入临时文件 -> 重命名"的方式确保状态文件写入的原子性，防止文件损坏。
+4.  **恢复逻辑**:
+    *   `scanAndTransport` 函数启动时，检查是否存在与 `taskId` 对应的有效状态文件。
+    *   如果存在且有效（例如，`taskId` 匹配，`configSnapshot` 基本一致），则加载状态。
+    *   根据加载的状态信息：
+        *   恢复 `FileProcessingQueue` 的内部队列和追踪器状态。
+        *   恢复 `Deduplicator` 的 `currentTaskMd5Set` 和跳过列表。
+        *   恢复 `processedFiles`, `packagePaths`, `transportSummary`, `failedItems` 列表。
+        *   调整后续逻辑，跳过已完成的步骤，从中断的队列开始处理。
+    *   如果状态文件不存在或无效，则作为新任务启动。
+5.  **状态清理**: 当任务**正常成功完成**后，删除对应的状态文件。
+
+## 3. 单元测试方案
+
+为了确保断点续传功能的健壮性，需要设计以下单元测试场景：
+
+1.  **状态保存测试 (`State Persistence Tests`)**:
+    *   测试在不同阶段（扫描后、MD5处理中、打包后、传输完成、任务结束时）能否正确生成包含预期信息的 `TaskState` 对象。
+    *   测试 `saveStateToFile` 函数能否成功将 `TaskState` 对象写入临时文件并重命名。
+    *   测试状态文件写入失败时的错误处理。
+2.  **状态加载测试 (`State Loading Tests`)**:
+    *   测试 `loadStateFromFile` 函数能否成功读取有效的状态文件并解析为 `TaskState` 对象。
+    *   测试状态文件不存在时的处理（应返回 null 或类似指示）。
+    *   测试状态文件损坏或格式无效时的处理（应视为无效状态）。
+    *   测试加载的状态与当前任务配置不匹配时的处理（例如 `rootDir` 不同，应视为无效状态）。
+3.  **恢复逻辑测试 (`Resumption Logic Tests`)**:
+    *   **场景1：扫描中断恢复**:
+        *   模拟：运行扫描，保存扫描到一半的状态（`scanState.pendingMatchedFiles` 有内容）。
+        *   验证：重新启动任务加载状态后，`FileProcessingQueue` 的 `matchedQueue` 被正确填充，并且后续处理从这些文件开始，而不是重新扫描。
+    *   **场景2：MD5计算中断恢复**:
+        *   模拟：运行到MD5计算阶段，处理一部分文件后保存状态（`queueState.md5Queue` 有剩余，`queueState.packagingQueue` 有部分文件，`deduplicationState` 有内容）。
+        *   验证：重新启动任务加载状态后，MD5队列和打包队列被正确恢复，`Deduplicator` 状态被恢复，处理从剩余的MD5计算开始，已完成MD5的文件进入打包，去重逻辑正确衔接。
+    *   **场景3：打包中断恢复**:
+        *   模拟：运行到打包阶段，成功打了一个包后保存状态（`queueState.packagingQueue` 有剩余，`progressState.packagePaths` 有内容，`queueState.transportQueue` 有一个包）。
+        *   验证：重新启动任务加载状态后，打包队列和传输队列被正确恢复，`packagePaths` 列表被恢复，处理从剩余的打包任务开始。
+    *   **场景4：传输中断恢复**:
+        *   模拟：运行到传输阶段，成功传输部分包后保存状态（`queueState.transportQueue` 有剩余，`progressState.transportSummary` 有部分结果，`deduplicationState.historicalMd5Set` 可能已更新）。
+        *   验证：重新启动任务加载状态后，传输队列和 `transportSummary` 被恢复，处理从剩余的传输任务开始，历史去重记录也应正确恢复。
+    *   **场景5：重试队列恢复**:
+        *   模拟：有文件进入重试队列后保存状态。
+        *   验证：重新启动后，重试队列被恢复，并在合适的时机重新尝试处理。
+4.  **状态清理测试 (`State Cleanup Tests`)**:
+    *   测试任务成功完成后，对应的状态文件是否被正确删除。
+    *   测试任务失败结束时，状态文件是否被保留（以便下次恢复）。
+
+这些测试需要结合 Mocking 技术（例如 Mock 文件系统操作 `fs-extra`，Mock 队列处理逻辑）来隔离测试单元并模拟中断场景。
+
+---
+
+请您审阅以上方案。如果方案可行，我将开始着手准备具体的代码实现，包括定义 `state.d.ts` 文件、实现状态的保存和加载逻辑，并将其集成到 `scanAndTransport` 函数中。

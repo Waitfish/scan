@@ -23,8 +23,8 @@ export interface PackagingTriggerOptions {
 /** 定义 scanAndTransport 配置接口 */
 export interface ScanAndTransportConfig {
   // --- 必需参数 ---
-  /** 要扫描的根目录 */
-  rootDir: string;
+  /** 要扫描的根目录列表 */
+  rootDirs: string[];
   /** 文件匹配规则 */
   rules: MatchRule[];
   /** 传输目标服务器基本信息 */
