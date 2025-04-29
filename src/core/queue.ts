@@ -126,7 +126,7 @@ export class FileProcessingQueue {
       archive: {
         enabled: true,
         checkInterval: 1000,
-        maxRetries: 3,
+      maxRetries: 3,
         keepTempFiles: false,
         ...stabilityConfig.archive
       }
@@ -359,11 +359,11 @@ export class FileProcessingQueue {
       this.markAsFailed(file.path, failureItem);
     } else {
       // 未超过最大重试次数，添加到重试队列
-      this.retryQueue.set(file.path, retryItem);
-      
-      // 确保文件在路径映射中
-      if (!this.pathMap.has(file.path)) {
-        this.pathMap.set(file.path, file);
+    this.retryQueue.set(file.path, retryItem);
+    
+    // 确保文件在路径映射中
+    if (!this.pathMap.has(file.path)) {
+      this.pathMap.set(file.path, file);
       }
     }
   }
@@ -527,7 +527,7 @@ export class FileProcessingQueue {
     const originalQueue = this.getOriginalQueue(targetQueue);
     if (!originalQueue) {
       console.error(`无效的队列类型: ${targetQueue}`);
-      return;
+        return;
     }
     
     // 调整批处理大小，确保不超过配置的并发数

@@ -830,8 +830,8 @@ export async function scanFiles(options: ScanOptions): Promise<ScanResult> {
           
           // 检查是否是支持的压缩包
           if (ARCHIVE_EXTENSIONS.has(fileExt)) {
-            try {
-              const stats = await fs.stat(fullPath);
+             try {
+                const stats = await fs.stat(fullPath);
               
               // 检查压缩包大小是否超过限制
               if (stats.size > maxFileSize) {
@@ -852,11 +852,11 @@ export async function scanFiles(options: ScanOptions): Promise<ScanResult> {
               } else {
                 // 根据类型调用不同的处理函数
                 if (fileExt === '.rar') {
-                  await scanRarArchive(fullPath, stats.birthtime, stats.mtime);
+                    await scanRarArchive(fullPath, stats.birthtime, stats.mtime);
                 } else {
-                  await scanCompressingArchive(fullPath, stats.birthtime, stats.mtime);
+                    await scanCompressingArchive(fullPath, stats.birthtime, stats.mtime);
                 }
-              }
+                }
             } catch (statError: any) {
               const failureItem: FailureItem = { 
                 type: 'fileStat', 
@@ -935,12 +935,12 @@ export async function scanFiles(options: ScanOptions): Promise<ScanResult> {
                 if (onFailure) {
                   onFailure(failureItem, { ...progress });
                 }
+                }
               }
-            }
           }
-        }
+              }
       }
-    } catch (error: any) {
+          } catch (error: any) {
       const failureItem: FailureItem = { 
         type: 'directoryAccess', 
         path: currentDir, 
@@ -970,7 +970,7 @@ export async function scanFiles(options: ScanOptions): Promise<ScanResult> {
     // 调用失败回调
     if (onFailure) {
       onFailure(failureItem, { ...progress });
-    }
+  }
   }
 
   // 记录结束时间

@@ -265,6 +265,8 @@ export interface PackageMetadata {
   checksumAlgorithm?: string;
   /** 错误记录（如果有） */
   errors?: ErrorMetadata[];
+  /** 打包过程中的警告信息 */
+  warnings?: string[];
 }
 
 /**

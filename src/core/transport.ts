@@ -658,7 +658,7 @@ export async function transferFile(
     
     // 连接到服务器
     await adapter.connect();
-
+    
     // 确保远程目录存在
     try {
       // 获取远程目录路径

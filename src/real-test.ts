@@ -34,15 +34,27 @@ async function createTestDirectory(): Promise<void> {
     await fs.writeFile(path.join(testRootDir, 'BuYunSou-analysis.pdf'), 'BuYunSou PDF');
     await fs.writeFile(path.join(testRootDir, 'config.js'), 'module.exports = {};');
     
+    // 在根目录创建一个冲突文件
+    await fs.writeFile(path.join(testRootDir, 'MeiTuan-plan.doc'), 'MeiTuan计划文档 - 根目录版本');
+    
     const subDir1 = path.join(testRootDir, 'project-a');
     await fs.ensureDir(subDir1);
-    await fs.writeFile(path.join(subDir1, 'MeiTuan-plan.doc'), 'MeiTuan DOC');
+    // 在子目录中创建同名文件 (与根目录的同名)
+    await fs.writeFile(path.join(subDir1, 'MeiTuan-plan.doc'), 'MeiTuan计划文档 - 项目A版本');
     await fs.writeFile(path.join(subDir1, 'data.json'), '{}');
     
     const deepDir = path.join(subDir1, 'deep-data');
     await fs.ensureDir(deepDir);
     await fs.writeFile(path.join(deepDir, 'archive.txt'), 'text file');
     await fs.writeFile(path.join(deepDir, 'BuYunSou-results.xls'), 'BuYunSou XLS');
+    // 在深层目录中再创建一个同名文件
+    await fs.writeFile(path.join(deepDir, 'MeiTuan-plan.doc'), 'MeiTuan计划文档 - 深层目录版本');
+    
+    // 创建另一个子目录并添加同名文件
+    const subDir2 = path.join(testRootDir, 'project-b');
+    await fs.ensureDir(subDir2);
+    await fs.writeFile(path.join(subDir2, 'MeiTuan-plan.doc'), 'MeiTuan计划文档 - 项目B版本');
+    await fs.writeFile(path.join(subDir2, 'BuYunSou-data.xls'), 'BuYunSou XLS - 项目B');
     
     const nodeModulesDir = path.join(testRootDir, 'node_modules');
     await fs.ensureDir(nodeModulesDir);
@@ -197,6 +209,49 @@ async function main(): Promise<void> {
     }
 
     console.log(`\n测试目录位于: ${testRootDir}`);
+
+    // 验证文件名冲突处理
+    console.log('\n检查文件名冲突处理:');
+    
+    // 尝试查找结果文件中的冲突文件处理信息
+    if (result.resultFilePath) {
+      try {
+        const resultContent = await fs.readJson(result.resultFilePath);
+        
+        // 查找所有最终包含在包中的 MeiTuan-plan.doc 文件
+        const planDocs = resultContent.processedFiles.filter((file: any) => 
+          file.originalName && file.originalName.includes('MeiTuan-plan.doc')
+        );
+        
+        if (planDocs.length > 0) {
+          console.log(`\n找到 ${planDocs.length} 个同名文件 "MeiTuan-plan.doc":`);
+          planDocs.forEach((doc: any, index: number) => {
+            console.log(`[${index + 1}] 原始路径: ${doc.path}`);
+            console.log(`    原始名称: ${doc.originalName}`);
+            console.log(`    最终名称: ${doc.name}`);
+            console.log(`    MD5: ${doc.md5}`);
+          });
+        } else {
+          console.log('未找到同名冲突文件');
+        }
+        
+        // 检查警告信息中是否包含文件名冲突信息
+        if (resultContent.warnings && resultContent.warnings.length > 0) {
+          const conflictWarnings = resultContent.warnings.filter((warning: string) => 
+            warning.includes('文件名冲突')
+          );
+          
+          if (conflictWarnings.length > 0) {
+            console.log('\n文件名冲突警告:');
+            conflictWarnings.forEach((warning: string, index: number) => {
+              console.log(`[${index + 1}] ${warning}`);
+            });
+          }
+        }
+      } catch (error) {
+        console.error('读取结果文件时出错:', error);
+      }
+    }
 
   } catch (error) {
     console.error('\n处理过程中出错:', error);

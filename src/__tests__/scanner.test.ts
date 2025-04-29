@@ -490,7 +490,7 @@ describe('文件扫描器', () => {
         },
         onFileMatched: (file) => {
           matchedFiles.push(file);
-          matchedFileReported = true;
+            matchedFileReported = true;
           expect(file.name).toMatch(/^MeiTuan.*/);
           expect(file.path).toBeDefined();
         }

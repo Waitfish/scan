@@ -351,8 +351,8 @@ describe('文件打包模块', () => {
       // 调用批量打包函数
       const result = await createBatchPackage(mixedFileItems, outputPath, defaultOptions);
       
-      // 验证结果 - 应该成功，但有失败的文件
-      expect(result.success).toBe(true);
+      // 验证结果 - 应该失败，因为有文件处理错误
+      expect(result.success).toBe(false); // 当有任何文件处理错误时，success应为false
       expect(result.errors).toBeDefined();
       expect(result.errors!.length).toBe(2); // 两个不存在的文件
       
@@ -464,8 +464,8 @@ describe('文件打包模块', () => {
         includeMetadata: true
       });
       
-      // 即使文件不存在，整体过程也应该成功，但会在元数据中记录错误
-      expect(result.success).toBe(true);
+      // 即使文件不存在，整体过程也不应该完全成功
+      expect(result.success).toBe(false); // 当有任何文件处理错误时，success应为false
       expect(result.errors).toBeDefined();
       expect(result.errors!.length).toBe(1);
       expect(result.errors![0].file.name).toBe('nonexistent.txt');
@@ -489,7 +489,7 @@ describe('文件打包模块', () => {
       const result = await createBatchPackage([emptyPathItem], outputPath, defaultOptions);
       
       // 应该处理错误但不崩溃
-      expect(result.success).toBe(true);
+      expect(result.success).toBe(false); // 当有任何文件处理错误时，success应为false
       expect(result.errors).toBeDefined();
       expect(result.errors!.length).toBe(1);
     });
@@ -505,25 +505,31 @@ describe('文件打包模块', () => {
       
       // 验证结果 - 应该失败并返回错误
       expect(result.success).toBe(false);
-      expect(result.error).toBeDefined();
+      expect(result.errors).toBeDefined();
+      expect(result.errors!.length).toBeGreaterThan(0);
+      expect(result.errors!.some(e => e.error instanceof Error)).toBe(true);
     });
 
     test('处理文件名冲突的情况', async () => {
       // 创建两个文件名相同但内容不同的文件项
-      const conflictFile1 = path.join(testDir, 'conflict-1.txt');
-      const conflictFile2 = path.join(testDir, 'conflict-2.txt');
-      
-      await fs.writeFile(conflictFile1, 'Content of file 1');
-      await fs.writeFile(conflictFile2, 'Content of file 2');
-      
-      const stats1 = await fs.stat(conflictFile1);
-      const stats2 = await fs.stat(conflictFile2);
-      
-      // 两个文件项有相同的name但不同的path
+      const conflictFile1Path = path.join(testDir, 'conflict-dir-1');
+      const conflictFile2Path = path.join(testDir, 'conflict-dir-2');
+      const normalFilePath = path.join(testDir, 'normal.txt');
+
+      await fs.writeFile(conflictFile1Path, 'Content of file 1');
+      await fs.writeFile(conflictFile2Path, 'Content of file 2');
+      await fs.writeFile(normalFilePath, 'Normal file content');
+
+      const stats1 = await fs.stat(conflictFile1Path);
+      const stats2 = await fs.stat(conflictFile2Path);
+      const statsNormal = await fs.stat(normalFilePath);
+
+      // 两个文件项有相同的初始 name 但不同的 path
+      // 不设置 originalName，让函数自己填充
       const conflictItems: FileItem[] = [
         {
-          path: conflictFile1,
-          name: 'conflict.txt', // 相同的文件名
+          path: conflictFile1Path,
+          name: 'conflict.txt', // 初始目标名称
           size: stats1.size,
           createTime: stats1.birthtime,
           modifyTime: stats1.mtime,
@@ -531,27 +537,74 @@ describe('文件打包模块', () => {
           nestedLevel: 0
         },
         {
-          path: conflictFile2,
-          name: 'conflict.txt', // 相同的文件名
+          path: conflictFile2Path,
+          name: 'conflict.txt', // 初始目标名称
           size: stats2.size,
           createTime: stats2.birthtime,
           modifyTime: stats2.mtime,
           origin: 'filesystem',
           nestedLevel: 0
+        },
+        {
+          path: normalFilePath,
+          name: 'normal.txt',   // 正常文件
+          size: statsNormal.size,
+          createTime: statsNormal.birthtime,
+          modifyTime: statsNormal.mtime,
+          origin: 'filesystem',
+          nestedLevel: 0
         }
       ];
-      
+
       const outputPath = path.join(testDir, 'conflict-package.zip');
-      
+
       // 调用批量打包
       const result = await createBatchPackage(conflictItems, outputPath, defaultOptions);
-      
-      // 验证结果 - 后面的文件应该覆盖前面的文件
-      expect(result.success).toBe(true);
-      
-      const { files } = await extractZipAndGetMetadata(outputPath);
-      // 应该只有一个conflict.txt文件（后者覆盖前者）
-      expect(files.filter(f => f === 'conflict.txt').length).toBe(1);
+
+      // 验证结果 - 应该成功，但有警告
+      expect(result.success).toBe(true); // 文件本身没有错误，打包应成功
+      expect(result.warnings).toBeDefined();
+      // 应该有一个警告信息关于重命名，基于冲突的 name
+      // 警告信息现在包含原始文件名和目标名
+      expect(result.warnings).toContain('文件名冲突: "conflict.txt" (目标名 "conflict.txt") 已重命名为 "conflict-1.txt"');
+      expect(result.fileCount).toBe(3); // 所有文件都应该被处理
+
+      // 验证ZIP文件内容
+      const { files, metadata } = await extractZipAndGetMetadata(outputPath);
+
+      // 压缩包内应该包含重命名后的文件
+      expect(files).toContain('conflict.txt'); // 第一个文件保持原名
+      expect(files).toContain('conflict-1.txt'); // 第二个文件应被重命名为 conflict-1.txt
+      expect(files).toContain('normal.txt');
+      expect(files).toContain(defaultOptions.metadataFileName); // 包含元数据文件
+      expect(files.length).toBe(4);
+
+      // 验证元数据内容
+      expect(metadata).toBeDefined();
+      if (metadata) {
+        expect(metadata.files.length).toBe(3);
+        const metaFile1 = metadata.files.find(f => f.name === 'conflict.txt');
+        const metaFile2 = metadata.files.find(f => f.name === 'conflict-1.txt');
+        const metaFileNormal = metadata.files.find(f => f.name === 'normal.txt');
+
+        expect(metaFile1).toBeDefined();
+        expect(metaFile2).toBeDefined();
+        expect(metaFileNormal).toBeDefined();
+
+        // 检查 originalName 是否被正确记录 (基于 path)
+        expect(metaFile1!.originalName).toBe('conflict.txt');
+        expect(metaFile2!.originalName).toBe('conflict.txt');
+        expect(metaFileNormal!.originalName).toBe('normal.txt');
+        // 检查 name 是否反映最终名称
+        expect(metaFile1!.name).toBe('conflict.txt');
+        expect(metaFile2!.name).toBe('conflict-1.txt');
+        expect(metaFileNormal!.name).toBe('normal.txt');
+
+        // 可以在元数据中检查 warnings
+        expect(metadata.warnings).toBeDefined();
+        // 匹配更新后的警告信息格式
+        expect(metadata.warnings!.some(w => w.includes('目标名 "conflict.txt") 已重命名为 "conflict-1.txt"'))).toBe(true);
+      }
     });
   });
 
@@ -776,10 +829,13 @@ describe('文件打包模块', () => {
         
         // 验证结果
         expect(result.success).toBe(false);
-        expect(result.error).toBeDefined();
+        // expect(result.error).toBeDefined(); // 不应检查result.error
         // 应该有多个文件错误记录
         expect(result.errors).toBeDefined();
         expect(result.errors!.length).toBeGreaterThan(0);
+        expect(result.errors!.some(e => e.error instanceof Error)).toBe(true);
+        // 检查是否包含模拟的压缩错误
+        expect(result.errors!.some(e => e.error.message.includes('模拟压缩失败'))).toBe(true);
       } finally {
         // 恢复原始函数
         (zip.compressDir as any) = originalCompressDir;

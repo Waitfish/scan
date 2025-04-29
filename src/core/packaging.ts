@@ -256,16 +256,63 @@ export async function createBatchPackage(
   const errors: Array<{file: FileItem; error: Error;}> = [];
   const warnings: string[] = [];
   const successFiles: FileItem[] = [];
-  
+
   // 创建临时目录
   const packageTempDir = path.join(opts.tempDir || 'temp', `pkg_${Date.now()}`);
   try {
     await fs.promises.mkdir(packageTempDir, { recursive: true });
-    
-    // 用于检查文件名冲突
-    const fileNameMap = new Map<string, number>();
-    
-    // 处理文件
+
+    // === 新的文件名冲突处理逻辑 ===
+    const usedTargetNames = new Set<string>(); // 用于跟踪最终使用的目标文件名
+
+    for (const fileItem of fileItems) {
+      // 1. 无条件填充 originalName (如果尚未填充)
+      // 假设 fileItem.path 总是可用
+      if (!fileItem.originalName) {
+        // fileItem.originalName = path.basename(fileItem.path); // <-- 旧逻辑，从路径推断，可能导致不准确
+        fileItem.originalName = fileItem.name || path.basename(fileItem.path); // <-- 新逻辑，优先使用 name
+      }
+      // 确保 name 字段也已初始化
+      if (fileItem.name === undefined || fileItem.name === null) {
+        fileItem.name = fileItem.originalName;
+      }
+
+      let currentName = fileItem.name;
+
+      if (!usedTargetNames.has(currentName)) {
+        // 没有冲突，将当前 name 加入已使用集合
+        usedTargetNames.add(currentName);
+      } else {
+        // 发生冲突，需要基于 originalName 生成新 name
+        // const originalBase = path.basename(fileItem.originalName, path.extname(fileItem.originalName)); // <-- 旧逻辑
+        // const extension = path.extname(fileItem.originalName);
+        // --- 新逻辑：基于冲突的 currentName 生成 --- 
+        const conflictingBase = path.basename(currentName, path.extname(currentName));
+        const extension = path.extname(currentName);
+        // --- 结束新逻辑 ---
+        let counter = 1;
+        // let newName = `${originalBase}-${counter}${extension}`; // <-- 旧逻辑
+        let newName = `${conflictingBase}-${counter}${extension}`; // <-- 新逻辑
+        
+        // 循环查找未被使用的名称
+        while (usedTargetNames.has(newName)) {
+          counter++;
+          // newName = `${originalBase}-${counter}${extension}`; // <-- 旧逻辑
+          newName = `${conflictingBase}-${counter}${extension}`; // <-- 新逻辑
+        }
+
+        // 记录警告 (警告信息仍使用 originalName 比较好，以指明是哪个原始文件冲突了)
+        warnings.push(`文件名冲突: "${fileItem.originalName}" (目标名 "${currentName}") 已重命名为 "${newName}"`); // 调整警告信息更清晰
+
+        // 更新 FileItem 的 name 字段
+        fileItem.name = newName;
+        // 将新生成的、唯一的 name 加入已使用集合
+        usedTargetNames.add(newName);
+      }
+    }
+    // === 文件名冲突处理逻辑结束 ===
+
+    // 处理文件 (复制到临时目录)
     for (const fileItem of fileItems) {
       try {
         if (opts.onProgress) {
@@ -273,184 +320,175 @@ export async function createBatchPackage(
             processedFiles,
             totalFiles: fileCount,
             percentage: Math.floor((processedFiles / fileCount) * 100),
-            currentFile: fileItem.path,
+            currentFile: fileItem.path, // 显示原始路径更有意义
             currentFileProgress: 0
           };
           opts.onProgress(progress);
         }
-        
-        // 检查文件名是否存在
-        let destFileName = fileItem.name;
-        if (fileNameMap.has(destFileName)) {
-          // 文件名冲突，添加计数后缀
-          const count = fileNameMap.get(destFileName)! + 1;
-          fileNameMap.set(destFileName, count);
-          
-          // 保存原始文件名
-          if (!fileItem.originalName) {
-            fileItem.originalName = fileItem.name;
-          }
-          
-          // 分解文件名和扩展名
-          const extIndex = destFileName.lastIndexOf('.');
-          if (extIndex > 0) {
-            // 有扩展名
-            const baseName = destFileName.substring(0, extIndex);
-            const extension = destFileName.substring(extIndex);
-            destFileName = `${baseName}_${count}${extension}`;
-          } else {
-            // 无扩展名
-            destFileName = `${destFileName}_${count}`;
-          }
-          
-          // 更新文件名
-          fileItem.name = destFileName;
-          
-          warnings.push(`文件名冲突: "${fileItem.originalName}" 已重命名为 "${destFileName}"`);
-        } else {
-          // 记录文件名
-          fileNameMap.set(destFileName, 0);
-        }
-        
+
         let sourcePath = fileItem.path;
-        // 处理压缩包内文件
+
+        // 处理压缩包内文件 (如果需要提取)
         if (fileItem.origin === 'archive' && fileItem.archivePath && fileItem.internalPath) {
+          // TODO: 实现从压缩包提取文件的逻辑，如果需要的话
+          // 这里假设 sourcePath 已经指向了解压后的临时文件路径，或者需要在这里处理提取
+          // 为了简化，暂时假设 sourcePath 是有效的，如果需要实际提取，这里需要补充代码
           try {
-            const extractDir = path.join(opts.tempDir || 'temp', `extract_${Date.now()}`);
-            await fs.promises.mkdir(extractDir, { recursive: true });
-            
-            // 这里需要实现从压缩包中提取文件的逻辑
-            // 临时跳过这部分实现，只做路径检查
-            try {
-              await fs.promises.access(sourcePath);
-            } catch (error: any) {
-              throw new Error(`从压缩包提取文件时出错: ${error.message}`);
-            }
-          } catch (error: any) {
-            throw new Error(`处理压缩包文件时出错: ${error.message}`);
+            await fs.promises.access(sourcePath);
+          } catch (accessError: any) {
+             // 如果路径无效，则尝试从 archivePath 提取 internalPath 到临时位置
+             // 这部分逻辑需要根据具体实现添加
+            throw new Error(`处理压缩包内文件失败: 无法访问源路径 ${sourcePath} 或未实现提取逻辑。`);
           }
         }
-        
-        // 复制文件到临时目录
-        const destPath = path.join(packageTempDir, destFileName);
+
+        // 检查源文件是否存在 (防御性编程)
+        if (!await fs.pathExists(sourcePath)) {
+            throw new Error(`源文件不存在: ${sourcePath}`);
+        }
+
+        // 复制文件到临时目录，使用最终确定的 fileItem.name
+        const destPath = path.join(packageTempDir, fileItem.name);
         await fs.promises.copyFile(sourcePath, destPath);
-        
-        // 更新进度和记录成功文件
+
+        // 更新进度和记录成功文件 (只记录元数据所需信息)
         processedFiles++;
-        successFiles.push({...fileItem});
-        
+        successFiles.push({...fileItem}); // 存储处理后的FileItem，包含更新后的name和originalName
+
+        // 单个文件处理完成后的进度回调 (可选)
+        if (opts.onProgress) {
+            opts.onProgress({
+                processedFiles,
+                totalFiles: fileCount,
+                percentage: Math.floor((processedFiles / fileCount) * 100),
+                currentFile: fileItem.path,
+                currentFileProgress: 100 // 假设复制完成代表100%
+            });
+        }
+
       } catch (error: any) {
         errors.push({
-          file: fileItem,
+          file: fileItem, // 记录原始的 fileItem 信息
           error: error instanceof Error ? error : new Error(error.message || String(error))
         });
+        // 即使出错，也更新总进度计数，避免百分比卡住
+        processedFiles++;
+        if (opts.onProgress) {
+            opts.onProgress({
+                processedFiles,
+                totalFiles: fileCount,
+                percentage: Math.floor((processedFiles / fileCount) * 100),
+                currentFile: fileItem.path,
+                currentFileProgress: 100 // 标记为完成（即使是失败）
+            });
+        }
       }
     }
-    
-    // 确保至少有一个文件要打包，或者是空文件列表的特殊情况
+
+    // 确保至少有一个文件成功处理，或者明确是空列表的情况
     if (successFiles.length === 0 && fileItems.length > 0) {
-      // 即使所有文件都失败了，我们仍然创建一个只包含元数据的ZIP包
-      warnings.push('所有文件处理失败: 只创建包含元数据的ZIP');
+      warnings.push('所有文件处理失败，但仍将创建包含元数据的ZIP包');
+    } else if (fileItems.length === 0) {
+      warnings.push('空文件列表，创建只包含元数据的ZIP包');
     }
-    
-    // 如果是空文件列表，添加一个警告
-    if (fileItems.length === 0) {
-      warnings.push('空文件列表: 只创建包含元数据的ZIP');
-    }
-    
+
     // 创建元数据
     if (opts.includeMetadata) {
       const metadataPath = path.join(packageTempDir, opts.metadataFileName || 'metadata.json');
-      
-      // 准备元数据内容
-      const metadataContent: any = {
-        version: opts.metadataVersion || '1.0',
-        packagedAt: new Date().toISOString(),
-        createdAt: new Date().toISOString(),
-        tags: opts.packageTags || [],
-        enhancedMetadata: opts.enhancedMetadata || false,
-        files: []
+
+      // 序列化成功的文件列表 (使用处理后的 fileItem)
+      const serializedFiles = successFiles.map(item => serializeFileItem(item));
+
+      // 创建元数据对象
+      const metadata: PackageMetadata = {
+        createdAt: startTime.toISOString(), // 使用打包开始时间
+        files: serializedFiles
       };
-      
-      // 添加增强元数据的特殊字段
+
+      // 添加增强元数据字段
       if (opts.enhancedMetadata) {
-        metadataContent.packageId = `pkg_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
-        metadataContent.checksumAlgorithm = 'md5';
+        metadata.version = opts.metadataVersion || '1.0';
+        metadata.packageId = `pkg_${startTime.getTime()}_${Math.random().toString(36).substring(2, 10)}`;
+        metadata.tags = opts.packageTags || [];
+        metadata.checksumAlgorithm = opts.includeMd5 ? 'md5' : undefined; // 根据选项决定
       }
-      
-      // 只包含成功的文件在元数据中
-      if (opts.enhancedMetadata) {
-        metadataContent.files = successFiles.map(item => serializeFileItem(item));
-      } else {
-        // 否则只包含基本信息
-        metadataContent.files = successFiles.map(item => ({
-          name: item.name,
-          originalName: item.originalName,
-          size: item.size,
-          md5: item.md5
-        }));
-      }
-      
+
       // 添加错误信息到元数据
       if (errors.length > 0) {
-        metadataContent.errors = errors.map(err => ({
-          file: err.file.name,
-          error: err.error.message
+        metadata.errors = errors.map(err => ({
+          // 调整为符合 ErrorMetadata 的结构 (假设需要 file 和 error)
+          file: err.file.name, // 使用处理后的文件名
+          error: err.error.message,
+          // 可以选择性地添加其他信息
+          path: err.file.path,
+          originalName: err.file.originalName
         }));
       }
-      
-      await fs.promises.writeFile(metadataPath, JSON.stringify(metadataContent, null, 2));
+
+      // 添加警告信息到元数据 (可选, 假设类型已添加)
+      if (warnings.length > 0) {
+          (metadata as any).warnings = warnings; // 临时使用 any, 等待类型更新
+      }
+
+      await fs.promises.writeFile(metadataPath, JSON.stringify(metadata, null, 2));
     }
-    
+
     // 确保输出目录存在
     await fs.ensureDir(path.dirname(outputPath));
-    
-    // 压缩打包
+
+    // 压缩打包 (只压缩临时目录中的内容)
     await zip.compressDir(packageTempDir, outputPath, {
-      level: opts.compressionLevel || 6,
+      level: opts.compressionLevel ?? 6,
       ignoreBase: true
     });
-    
-    // 最终进度回调
+
+    // 最终进度回调 (确保总是100%)
     if (opts.onProgress) {
       opts.onProgress({
-        processedFiles: fileCount,
+        processedFiles: fileCount, // 报告处理的文件总数
         totalFiles: fileCount,
         percentage: 100,
         currentFile: '',
         currentFileProgress: 100
       });
     }
-    
+
+    const endTime = new Date();
     return {
-      success: true, // 即使有错误，也返回true，错误会记录在errors中
+      success: errors.length === 0, // 仅当没有文件处理错误时才算完全成功
       packagePath: outputPath,
       outputPath,
-      fileCount: processedFiles,
+      fileCount: successFiles.length, // 成功打包的文件数
       errors,
       warnings,
       packagedAt: startTime,
-      duration: new Date().getTime() - startTime.getTime()
+      duration: endTime.getTime() - startTime.getTime()
     };
-    
+
   } catch (error: any) {
+    // 捕捉创建临时目录、写入元数据、压缩等过程中的顶层错误
+    const endTime = new Date();
+    errors.push({ file: {} as FileItem, error: error instanceof Error ? error : new Error(String(error)) }); // 添加全局错误
     return {
       success: false,
       packagePath: '',
       outputPath: '',
       fileCount: 0,
       errors,
-      error: error instanceof Error ? error : new Error(error.message || String(error)),
+      // error: error instanceof Error ? error : new Error(error.message || String(error)),
       warnings,
       packagedAt: startTime,
-      duration: new Date().getTime() - startTime.getTime()
+      duration: endTime.getTime() - startTime.getTime()
     };
   } finally {
     // 清理临时目录
     try {
       await fs.promises.rm(packageTempDir, { recursive: true, force: true });
-    } catch (error: any) {
-      console.error(`清理临时目录时出错: ${error.message}`);
+    } catch (cleanupError: any) {
+      // 记录清理错误，但不影响最终结果
+      console.error(`清理临时目录 ${packageTempDir} 时出错: ${cleanupError.message}`);
+      // 可以考虑将清理错误添加到 warnings
+      warnings.push(`清理临时目录失败: ${cleanupError.message}`);
     }
   }
 }
